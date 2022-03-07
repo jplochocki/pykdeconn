@@ -8,6 +8,12 @@ import time
 import ssl
 import os.path
 import signal
+import asyncio
+import typing
+import re
+import sys
+from dataclasses import dataclass, field, asdict  # noqa
+import datetime
 
 import anyio
 from anyio.streams.tls import TLSStream, TLSListener
@@ -22,7 +28,7 @@ class CustomFormatter(logging.Formatter):
     bold_red = '\x1b[31;1m'
     green = '\x1b[32m'
     reset = '\x1b[0m'
-    format = '%(asctime)s / %(levelname)s (%(lineno)d) :::  %(message)s'
+    format = '[ %(levelname)s %(asctime)s %(funcName)20s()::%(lineno)d ]\n\t%(message)s'  # noqa
 
     FORMATS = {
         logging.DEBUG: grey + format + reset,
@@ -87,38 +93,115 @@ GSCONNECT_KNOWN_DEVICES = []
 CONNECTED_DEVICES = []
 
 
-async def wait_for_incoming_id(main_group):
-    async with await anyio.create_udp_socket(
-            family=socket.AF_INET, local_host='255.255.255.255',
-            local_port=KDE_CONNECT_DEFAULT_PORT) as udp:
-        async for data, (host, port) in udp:
-            try:
-                pack = json.loads(data.decode('utf-8'))
-            except json.JSONDecodeError:
-                log.exception(('wait_for_incoming_id(): malformed id packet '
-                               f'{data} from {host}:{port}'))
-                return
-
-            if pack['type'] != 'kdeconnect.identity' or 'deviceId' not in pack['body']:  # noqa
-                log.warning(
-                    ('wait_for_incoming_id(): identity packet without '
-                     f'body.deviceId or unknown type\n{pack=}'))
-                return
-
-            dev_id = pack['body']['deviceId']
-            known = dev_id in GSCONNECT_KNOWN_DEVICES
-            log.info(('wait_for_incoming_id(): id packet received from '
-                      f'{pack["body"]["deviceName"]} / {dev_id} (IP: {host})'
-                      f'{known=}'))
-
-            if not known or dev_id == GSCONNECT_DEVICE_ID or dev_id in CONNECTED_DEVICES:  # noqa
-                return
-
-            main_group.start_soon(device_connection_task, pack, host)
+CONFIG_FILE = 'gsconnect.config.json'
 
 
-def generate_my_identity():
+KDEConnectPacket = typing.Dict[str, typing.Any]
+
+
+class EnhancedJSONEncoder(json.JSONEncoder):
+    def default(self, obj):
+        type_name = re.match(r'^(.+?)\(', repr(obj)).group(1)
+        args = {
+            'datetime.datetime': ('year', 'month', 'day', 'hour', 'minute',
+                                  'second'),
+            'datetime.date': ('year', 'month', 'day'),
+            'datetime.time': ('hour', 'minute', 'second', 'microsecond'),
+            'datetime.timedelta': ('days', 'seconds', 'microseconds'),
+        }.get(type_name, None)
+
+        if args:
+            return {
+                '__type__': type_name,
+                '__args__': json.dumps([getattr(obj, a) for a in args])
+            }
+
+        return super().default(obj)
+
+
+class EnhancedJSONDecoder(json.JSONDecoder):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, object_hook=self.object_hook,
+                         **kwargs)
+
+    def object_hook(self, d):
+        available_types = ('datetime.datetime', 'datetime.date',
+                           'datetime.time', 'datetime.timedelta')
+        if d.get('__type__', None) not in available_types:
+            return d
+
+        o = sys.modules[__name__]
+        for e in d['__type__'].split('.'):
+            o = getattr(o, e)
+
+        args = json.loads(d.get('__args__', ''))
+        return o(*args)
+
+
+@dataclass
+class DeviceConfig:
+    device_id: str
+    device_name: str
+    certificate_PEM: str = field(default='')
+    paired: bool = field(default=False)
+    last_ip: str = field(default='')
+    last_connection_date: datetime.datetime = field(
+        default_factory=lambda: datetime.datetime.now())
+
+    def __post_init__(self):
+        self._ssl_cnx_cache = {}
+        self.connected = False
+
+    @staticmethod
+    def is_known_device(device_id: str) -> bool:
+        """
+        Checks in the configuration whether the device ID is known.
+        """
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r') as f:
+                cfg = json.load(f, cls=EnhancedJSONDecoder)
+                if 'devices' in cfg and device_id in cfg['devices']:
+                    return True
+
+        return False
+
+    @classmethod
+    def load_from_id_pack(cls, pack: KDEConnectPacket):
+        if pack['type'] != 'kdeconnect.identity' or 'deviceId' not in pack['body']:  # noqa
+            raise RuntimeError(
+                ('Identity packet without body.deviceId or unknown type\n'
+                 f'{pack=}'))
+
+        if DeviceConfig.is_known_device(pack['body']['deviceId']):
+            dev = DeviceConfig.load(pack['body']['deviceId'])
+            dev.device_name = pack['body']['deviceName']
+            return dev
+
+        return DeviceConfig(device_id=pack['body']['deviceId'],
+                            device_name=pack['body']['deviceName'])
+
+    @classmethod
+    def load(cls, device_id: str):
+        """Loads device config."""
+        pass
+
+
+def prepare_to_send(pack: KDEConnectPacket) -> bytes:
+    """
+    Prepare packet to send.
+    """
+    pack2 = pack.copy()
+    pack2['id'] = int(time.time())
+    return (json.dumps(pack2) + '\n').encode('utf-8')
+
+
+def generate_my_identity() -> KDEConnectPacket:
+    """
+    Generates ID packet for this device.
+    """
     return {
+        'id': 0,
         'type': 'kdeconnect.identity',
         'body': {
             'deviceId': GSCONNECT_DEVICE_ID,
@@ -132,13 +215,75 @@ def generate_my_identity():
     }
 
 
-def prepare_to_send(pack):
-    pack2 = pack.copy()
-    pack2['id'] = time.time_ns()
-    return (json.dumps(pack2) + '\n').encode('utf-8')
+could_send_my_id_packs = asyncio.Event()
 
 
-async def device_connection_task(id_packet, remote_ip):
+async def send_my_id_packets():
+    """
+    Sends this device ID packets (kdeconnect.identity) using UDP broadcast.
+    """
+    id_pack = generate_my_identity()
+
+    async with await anyio.create_udp_socket(
+            family=socket.AF_INET, reuse_port=True,
+            local_port=KDE_CONNECT_DEFAULT_PORT) as udp_sock:
+
+        a = udp_sock.extra(anyio.abc.SocketAttribute.raw_socket)
+        a.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+
+        while True:
+            await could_send_my_id_packs.wait()
+
+            await udp_sock.sendto(
+                prepare_to_send(id_pack), '<broadcast>',
+                KDE_CONNECT_DEFAULT_PORT)
+
+            await anyio.sleep(2)
+
+
+async def wait_for_incoming_id(main_group):
+    """
+    Listens on UDP Broadcast for incoming device ID packets.
+    """
+    async with await anyio.create_udp_socket(
+            family=socket.AF_INET, local_host='255.255.255.255',
+            local_port=KDE_CONNECT_DEFAULT_PORT, reuse_port=True) as udp_sock:
+        async for data, (host, port) in udp_sock:
+            try:
+                pack = json.loads(data.decode('utf-8'))
+            except json.JSONDecodeError:
+                log.exception(f'Malformed packet from {host}:{port}\n{data}')
+                continue
+
+            if pack['type'] != 'kdeconnect.identity':
+                log.warning(
+                    f'kdeconnect.identity packet expected, got {pack["type"]}')
+                continue
+
+            pack_body = pack['body']
+            if 'deviceId' not in pack_body or pack_body['deviceId'] == '':
+                log.warning(f'Identity packet without body.deviceId\n{pack=}')
+                continue
+
+            dev_id = pack_body['deviceId']
+            dev_name = pack_body['deviceName']
+            known = 'known' if dev_id in GSCONNECT_KNOWN_DEVICES else 'unknown'
+            log.debug((
+                f'Id packet received from {known} device: {dev_name} / '
+                f'{dev_id} (IP: {host})'))
+
+            if dev_id in GSCONNECT_KNOWN_DEVICES or dev_id == GSCONNECT_DEVICE_ID or dev_id in CONNECTED_DEVICES:  # noqa
+                continue
+
+            # start connection task
+            main_group.start_soon(outgoing_connection_task, pack, host)
+
+
+async def outgoing_connection_task(
+        id_packet: KDEConnectPacket, remote_ip: str):
+    """
+    Outgoing conection to the known device.
+    """
     remote_deviceName = id_packet['body']['deviceName']
     remote_deviceId = id_packet['body']['deviceId']
     CONNECTED_DEVICES.append(remote_deviceId)
@@ -358,9 +503,11 @@ async def main():
     assert os.path.exists(GSCONNECT_CERTFILE) and os.path.exists(GSCONNECT_KEYFILE)  # noqa
 
     # main task
+    could_send_my_id_packs.set()
     async with anyio.create_task_group() as main_group:
         main_group.start_soon(signal_handler, main_group.cancel_scope)
         main_group.start_soon(wait_for_incoming_id, main_group)
+        main_group.start_soon(send_my_id_packets)
 
     log.info('Application end')
 
