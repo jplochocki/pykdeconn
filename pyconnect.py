@@ -14,11 +14,12 @@ import re
 import sys
 from dataclasses import dataclass, field, asdict  # noqa
 import datetime
+import uuid
+import subprocess
 
 import anyio
 from anyio.streams.tls import TLSStream, TLSListener
 from anyio.streams.buffered import BufferedByteReceiveStream
-from gi.repository import Gio
 
 
 class CustomFormatter(logging.Formatter):
@@ -28,7 +29,8 @@ class CustomFormatter(logging.Formatter):
     bold_red = '\x1b[31;1m'
     green = '\x1b[32m'
     reset = '\x1b[0m'
-    format = '[ %(levelname)s %(asctime)s %(funcName)20s()::%(lineno)d ]\n\t%(message)s'  # noqa
+    format = ('[ %(levelname)s %(asctime)s %(funcName)20s()::%(lineno)d ]\n\t'
+              '%(message)s')
 
     FORMATS = {
         logging.DEBUG: grey + format + reset,
@@ -77,23 +79,26 @@ log = logging.getLogger('pyconnect.detailed_log')
 KDE_CONNECT_DEFAULT_PORT = 1716
 KDE_CONNECT_TRANSFER_MIN = 1739
 KDE_CONNECT_TRANSFER_MAX = 1764
-PROTOCOL_VERSION = 7
-GSCONNECT_DEVICE_ID = ''
-GSCONNECT_DEVICE_NAME = ''
-INCOMING_CAPABILITIES = [
+KDE_CONNECT_PROTOCOL_VERSION = 7
+
+PYCONNECT_DEVICE_ID = None
+PYCONNECT_DEVICE_NAME = None
+
+PYCONNECT_INCOMING_CAPABILITIES = [
     'kdeconnect.share.request',
 ]
-OUTGOING_CAPABILITIES = [
+PYCONNECT_OUTGOING_CAPABILITIES = [
     'kdeconnect.share.request',
 ]
 
-GSCONNECT_CERTFILE = '~/.config/gsconnect/certificate.pem'
-GSCONNECT_KEYFILE = '~/.config/gsconnect/private.pem'
-GSCONNECT_KNOWN_DEVICES = []
+PYCONNECT_CERTFILE = None
+PYCONNECT_KEYFILE = None
+
 CONNECTED_DEVICES = []
 
-
-CONFIG_FILE = 'gsconnect.config.json'
+CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           'pyconnect.config.json')
+config = None
 
 
 KDEConnectPacket = typing.Dict[str, typing.Any]
@@ -139,6 +144,30 @@ class EnhancedJSONDecoder(json.JSONDecoder):
         return o(*args)
 
 
+def load_config() -> typing.Dict:
+    """
+    Loads config file.
+    """
+    global config
+    config = {
+        'devices': {}
+    }
+
+    if os.path.exists(CONFIG_FILE):
+        with open(CONFIG_FILE, 'r') as f:
+            config = json.load(f, cls=EnhancedJSONDecoder)
+
+    return config
+
+
+def save_config():
+    """
+    Saves config file.
+    """
+    with open(CONFIG_FILE, 'w') as f:
+        json.dump(config, f, indent=4, cls=EnhancedJSONEncoder)
+
+
 @dataclass
 class DeviceConfig:
     device_id: str
@@ -158,33 +187,67 @@ class DeviceConfig:
         """
         Checks in the configuration whether the device ID is known.
         """
-        if os.path.exists(CONFIG_FILE):
-            with open(CONFIG_FILE, 'r') as f:
-                cfg = json.load(f, cls=EnhancedJSONDecoder)
-                if 'devices' in cfg and device_id in cfg['devices']:
-                    return True
-
-        return False
+        return 'devices' in config and device_id in config['devices']
 
     @classmethod
     def load_from_id_pack(cls, pack: KDEConnectPacket):
-        if pack['type'] != 'kdeconnect.identity' or 'deviceId' not in pack['body']:  # noqa
+        """
+        Loads (or create) ``DeviceConfig`` from ``kdeconnect.identity`` packet.
+        """
+        if pack['type'] != 'kdeconnect.identity':
             raise RuntimeError(
-                ('Identity packet without body.deviceId or unknown type\n'
-                 f'{pack=}'))
+                f'kdeconnect.identity packet expected, got {pack["type"]}')
 
-        if DeviceConfig.is_known_device(pack['body']['deviceId']):
-            dev = DeviceConfig.load(pack['body']['deviceId'])
-            dev.device_name = pack['body']['deviceName']
-            return dev
+        pack_body = pack['body']
+        if 'deviceId' not in pack_body or pack_body['deviceId'] == '':
+            raise RuntimeError(
+                f'Identity packet without body.deviceId\n{pack=}')
 
-        return DeviceConfig(device_id=pack['body']['deviceId'],
-                            device_name=pack['body']['deviceName'])
+        if DeviceConfig.is_known_device(pack_body['deviceId']):
+            dev = DeviceConfig.load(pack_body['deviceId'])
+            dev.device_name = pack_body['deviceName']
+        else:
+            dev = DeviceConfig(device_id=pack_body['deviceId'],
+                               device_name=pack_body['deviceName'])
+
+        dev.save()
+        return dev
 
     @classmethod
     def load(cls, device_id: str):
         """Loads device config."""
-        pass
+        if 'devices' in config and device_id in config['devices']:
+            return cls(**config['devices'][device_id])
+        raise RuntimeError(f'Device id "{device_id}" not  configured.')
+
+    def save(self):
+        """Saves device config."""
+        if 'devices' not in config:
+            config['devices'] = {}
+
+        config['devices'][self.device_id] = asdict(self)
+        save_config()
+
+    def ssl_context(self, purpose: ssl.Purpose = ssl.Purpose.CLIENT_AUTH,
+                    renew: bool = False) -> ssl.SSLContext:
+        """Loads ``SSLContext`` for the specified ``purpose``."""
+        if not renew and purpose.shortname in self._ssl_cnx_cache:
+            return self._ssl_cnx_cache[purpose.shortname]
+
+        cnx = ssl.create_default_context(purpose)
+        cnx.load_cert_chain(
+            certfile=PYCONNECT_CERTFILE, keyfile=PYCONNECT_KEYFILE)
+
+        cnx.check_hostname = False
+        cnx.verify_mode = ssl.CERT_NONE
+
+        if self.certificate_PEM:
+            cnx.load_verify_locations(cadata=self.certificate_PEM)
+            cnx.check_hostname = True
+            cnx.verify_mode = ssl.CERT_REQUIRED
+
+        self._ssl_cnx_cache[purpose.shortname] = cnx
+        return cnx
 
 
 def prepare_to_send(pack: KDEConnectPacket) -> bytes:
@@ -204,12 +267,12 @@ def generate_my_identity() -> KDEConnectPacket:
         'id': 0,
         'type': 'kdeconnect.identity',
         'body': {
-            'deviceId': GSCONNECT_DEVICE_ID,
-            'deviceName': GSCONNECT_DEVICE_NAME,
+            'deviceId': PYCONNECT_DEVICE_ID,
+            'deviceName': PYCONNECT_DEVICE_NAME,
             'deviceType': 'laptop',
-            'protocolVersion': PROTOCOL_VERSION,
-            'incomingCapabilities': INCOMING_CAPABILITIES,
-            'outgoingCapabilities': OUTGOING_CAPABILITIES,
+            'protocolVersion': KDE_CONNECT_PROTOCOL_VERSION,
+            'incomingCapabilities': PYCONNECT_INCOMING_CAPABILITIES,
+            'outgoingCapabilities': PYCONNECT_OUTGOING_CAPABILITIES,
             'tcpPort': KDE_CONNECT_DEFAULT_PORT
         }
     }
@@ -220,7 +283,8 @@ could_send_my_id_packs = asyncio.Event()
 
 async def send_my_id_packets():
     """
-    Sends this device ID packets (kdeconnect.identity) using UDP broadcast.
+    Sends this device ID packets (``kdeconnect.identity``) using
+    ``UDP broadcast``.
     """
     id_pack = generate_my_identity()
 
@@ -241,9 +305,9 @@ async def send_my_id_packets():
             await anyio.sleep(2)
 
 
-async def wait_for_incoming_id(main_group):
+async def wait_for_incoming_id(main_group:  anyio.abc.TaskGroup):
     """
-    Listens on UDP Broadcast for incoming device ID packets.
+    Listens on ``UDP Broadcast`` for incoming device ID packets.
     """
     async with await anyio.create_udp_socket(
             family=socket.AF_INET, local_host='255.255.255.255',
@@ -266,79 +330,131 @@ async def wait_for_incoming_id(main_group):
                 continue
 
             dev_id = pack_body['deviceId']
+            if dev_id == PYCONNECT_DEVICE_ID or dev_id in CONNECTED_DEVICES:
+                continue
+
             dev_name = pack_body['deviceName']
-            known = 'known' if dev_id in GSCONNECT_KNOWN_DEVICES else 'unknown'
+            known = 'known' if DeviceConfig.is_known_device(dev_id) else 'unknown'  # noqa
             log.debug((
                 f'Id packet received from {known} device: {dev_name} / '
                 f'{dev_id} (IP: {host})'))
-
-            if dev_id in GSCONNECT_KNOWN_DEVICES or dev_id == GSCONNECT_DEVICE_ID or dev_id in CONNECTED_DEVICES:  # noqa
-                continue
 
             # start connection task
             main_group.start_soon(outgoing_connection_task, pack, host)
 
 
 async def outgoing_connection_task(
-        id_packet: KDEConnectPacket, remote_ip: str):
+        id_packet: KDEConnectPacket, remote_ip: str,
+        main_group: anyio.abc.TaskGroup):
     """
     Outgoing conection to the known device.
     """
-    remote_deviceName = id_packet['body']['deviceName']
-    remote_deviceId = id_packet['body']['deviceId']
-    CONNECTED_DEVICES.append(remote_deviceId)
+    dev_config = DeviceConfig.load_from_id_pack(id_packet)
 
-    log.info(('device_connection_task() started: '
-              f'{remote_ip} / {remote_deviceName}'))
-
-    # device config + certs
-    ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_context.load_cert_chain(GSCONNECT_CERTFILE, GSCONNECT_KEYFILE)
-    ssl_context.verify_flags = ssl.CERT_REQUIRED
-
-    gsconnect_config = Gio.Settings.new_with_path(
-        'org.gnome.Shell.Extensions.GSConnect.Device',
-        f'/org/gnome/shell/extensions/gsconnect/device/{remote_deviceId}/')
-
-    ssl_context.load_verify_locations(
-        cadata=ssl.PEM_cert_to_DER_cert(
-            gsconnect_config.get_string('certificate-pem')))
+    remote_port = id_packet['body']['tcpPort']
 
     # connect
-    async with await anyio.connect_tcp(remote_ip, KDE_CONNECT_DEFAULT_PORT) as sock:  # noqa
-        log.debug(
-            f'device_connection_task(): connected to {remote_ip} / {sock!r}')
+    async with await anyio.connect_tcp(remote_ip, remote_port) as sock:
+        log.info(
+            (f'Connected to {remote_ip}:{remote_port} '
+             f'({dev_config.device_name}).'))
+        CONNECTED_DEVICES.append(dev_config.device_id)
+        dev_config.connected = True
 
         # send identity
         await sock.send(prepare_to_send(generate_my_identity()))
-        log.debug('device_connection_task(): identity packet sent')
+        log.debug('Identity packet sent to {remote_ip}:{remote_port}.')
 
-        # wrap TSL
-        ssock = await TLSStream.wrap(sock, server_side=True,
-                                     ssl_context=ssl_context)
-        log.debug(('device_connection_task(): wrapped TSL connection '
-                   f'({ssock!r})'))
+        # wrap TLS
+        ssock = await TLSStream.wrap(
+            sock, server_side=True, ssl_context=dev_config.ssl_context(
+                ssl.Purpose.CLIENT_AUTH))
+        log.debug(f'Wrapped TLS connection with {remote_ip}:{remote_port}.')
+
+        # handle pair if needed
+        bssock = BufferedByteReceiveStream(ssock)
+        if not dev_config.paired:
+            if not await handle_pairing(ssock, bssock, dev_config):
+                await ssock.aclose()
+                return
 
         # receiving packets
-        bssock = BufferedByteReceiveStream(ssock)
-        async with anyio.create_task_group() as slave_group:
-            slave_group.start_soon(test_upload_task, ssock, ssl_context)
+        while True:
+            pack = receive_packet(bssock)
+            if not pack:
+                continue
 
-            while True:
-                pack_data = await bssock.receive_until(b'\n', 1024 * 1024)
+            # unpair packet
+            if pack['type'] == 'kdeconnect.pair' and not pack['body']['pair']:
+                dev_config.paired = False
+                dev_config.save()
+                await ssock.aclose()
+                log.info('Unpairing {dev_config.device_name} done.')
+                return
 
-                try:
-                    pack = json.loads(pack_data)
-                except json.JSONDecodeError:
-                    log.exception(
-                        ('device_connection_task(): Error while decoding '
-                         f'packet / {pack_data}'))
-                    continue
-                log.debug(f'device_connection_task(): Packet {pack_data}')
+            if pack['type'] == 'kdeconnect.share.request':
+                main_group.start_soon(download_file_task, pack, remote_ip,
+                                      dev_config.ssl_context(
+                                          ssl.Purpose.CLIENT_AUTH))
 
-                if pack['type'] == 'kdeconnect.share.request':
-                    slave_group.start_soon(download_file_task, pack, remote_ip,
-                                           ssl_context)
+
+async def receive_packet(bssock: BufferedByteReceiveStream):
+    try:
+        pack_data = await bssock.receive_until(b'\n', 1024 * 1024 * 10)
+    except Exception:
+        log.exception('Error while receiving packet.')
+        return False
+
+    try:
+        pack = json.loads(pack_data)
+    except json.JSONDecodeError:
+        log.exception(f'Error while decoding packet\n{pack_data}')
+        return False
+
+    log.debug(f'Received packet:\n{pack}')
+
+    return pack
+
+
+auto_send_pair_request = False
+pair_request_auto_accept = False
+
+
+async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
+                         dev_config: DeviceConfig):
+    pair_pack = {
+        'id': 0,
+        'type': 'kdeconnect.pair',
+        'body': {
+            'pair': True
+        }
+    }
+
+    if auto_send_pair_request:
+        # TODO
+        pass
+    else:
+        # answer only the pair request
+        pack = await receive_packet(bssock)
+        if pack['type'] != 'kdeconnect.pair':
+            log.error((
+                'Unexpected packet type (expected kdeconnect.pair, got'
+                f' {pack["type"]}).\n{pack!r}'))
+            return False
+
+        if not pack['body']['pair']:
+            log.info('Unpairing {dev_config.device_name} done.')
+            dev_config.paired = False
+            dev_config.save()
+            return False
+
+        # TODO: pytanie do użytkownika
+
+        await ssock.send(prepare_to_send(pair_pack))
+        dev_config.paired = True
+        dev_config.save()
+        log.info('Pairing {dev_config.device_name} done.')
+        return True
 
 
 async def download_file_task(pack, remote_ip, ssl_context):
@@ -479,28 +595,75 @@ async def signal_handler(scope: anyio.CancelScope):
             return
 
 
+async def generate_cert():
+    """
+    Generates ``SSL`` certificate files.
+    """
+    global PYCONNECT_DEVICE_ID
+    PYCONNECT_DEVICE_ID = uuid.uuid4().urn.replace('urn:uuid:', '')
+
+    log.debug((f'Generating certs for {PYCONNECT_DEVICE_NAME} '
+               f'{PYCONNECT_DEVICE_ID} {PYCONNECT_CERTFILE} '
+               f'{PYCONNECT_KEYFILE}'))
+
+    openssl = await anyio.run_process(
+        ['openssl', 'req', '-new', '-x509', '-sha256', '-out',
+         PYCONNECT_CERTFILE, '-newkey', 'rsa:4096', '-nodes', '-keyout',
+         PYCONNECT_KEYFILE, '-days', '3650', '-subj',
+         '/O=jplochocki.github.io/OU=PYConnect/CN=' + PYCONNECT_DEVICE_ID],
+        stderr=subprocess.STDOUT, check=False)
+
+    if openssl.returncode != 0:
+        raise RuntimeError(
+            (f'OpenSSL returned an error code ({openssl.returncode})\n'
+             f'{openssl.stdout.decode()}'))
+
+    log.info((f'Cert generated for {PYCONNECT_DEVICE_NAME} '
+              f'/ {PYCONNECT_DEVICE_ID}'))
+
+
+async def read_cert_common_name(cert_file: str) -> str:
+    """
+    Reads ``CN`` field from ``SSL`` certificate.
+    """
+    openssl = await anyio.run_process([
+        'openssl', 'x509', '-in', cert_file, '-noout', '-subject', '-inform',
+        'pem'])
+
+    # subject=O = jplochocki.github.io, OU = PYConnect, CN = e0f7faa7...
+    a = re.search(r'CN\s*=\s*([^,\n]*)', openssl.stdout.decode(), re.I)
+    if not a:
+        raise RuntimeError(
+            f'Invalid cert CN string ({openssl.stdout.decode()})')
+
+    log.info(f'Certificate\'s CN name readed: {cert_file} = {a.group(1)}')
+
+    return a.group(1)
+
+
 async def main():
     # config
-    global GSCONNECT_CERTFILE, GSCONNECT_KEYFILE, GSCONNECT_DEVICE_ID, \
-        GSCONNECT_DEVICE_NAME, GSCONNECT_KNOWN_DEVICES
+    global config, PYCONNECT_CERTFILE, PYCONNECT_KEYFILE, PYCONNECT_DEVICE_ID,\
+        PYCONNECT_DEVICE_NAME
 
-    gsconnect_config = Gio.Settings.new_with_path(
-        'org.gnome.Shell.Extensions.GSConnect.Device',
-        '/org/gnome/shell/extensions/gsconnect/')
-    GSCONNECT_DEVICE_ID = gsconnect_config.get_string('id')
-    GSCONNECT_DEVICE_NAME = gsconnect_config.get_string('name')
+    load_config()
 
-    gsconnect_config = Gio.Settings.new_with_path(
-        'org.gnome.Shell.Extensions.GSConnect',
-        '/org/gnome/shell/extensions/gsconnect/')
-    GSCONNECT_KNOWN_DEVICES = list(gsconnect_config.get_value('devices'))
+    # init certs
+    PYCONNECT_DEVICE_NAME = socket.gethostname()
 
-    log.info((f'Application start as {GSCONNECT_DEVICE_NAME} '
-              f'({GSCONNECT_DEVICE_ID})'))
+    a = os.path.abspath(os.path.dirname(__file__))
+    b = re.sub(r'[^a-z0-9\-]', '', PYCONNECT_DEVICE_NAME.lower())
+    PYCONNECT_CERTFILE = os.path.join(a, f'certificate-{b}.pem')
+    PYCONNECT_KEYFILE = os.path.join(a, f'private-{b}.pem')
 
-    GSCONNECT_CERTFILE = os.path.expanduser(GSCONNECT_CERTFILE)
-    GSCONNECT_KEYFILE = os.path.expanduser(GSCONNECT_KEYFILE)
-    assert os.path.exists(GSCONNECT_CERTFILE) and os.path.exists(GSCONNECT_KEYFILE)  # noqa
+    if not os.path.exists(PYCONNECT_CERTFILE) or not os.path.exists(PYCONNECT_KEYFILE):  # noqa
+        await generate_cert()
+
+    if not PYCONNECT_DEVICE_ID:
+        PYCONNECT_DEVICE_ID = await read_cert_common_name(PYCONNECT_CERTFILE)
+
+    log.info((f'PYConnect starts as {PYCONNECT_DEVICE_NAME} '
+              f'({PYCONNECT_DEVICE_ID})'))
 
     # main task
     could_send_my_id_packs.set()
