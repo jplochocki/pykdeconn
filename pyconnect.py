@@ -8,7 +8,6 @@ import time
 import ssl
 import os.path
 import signal
-import asyncio
 import typing
 import re
 import sys
@@ -243,7 +242,6 @@ class DeviceConfig:
 
         if self.certificate_PEM:
             cnx.load_verify_locations(cadata=self.certificate_PEM)
-            cnx.check_hostname = True
             cnx.verify_mode = ssl.CERT_REQUIRED
 
         self._ssl_cnx_cache[purpose.shortname] = cnx
@@ -278,7 +276,7 @@ def generate_my_identity() -> KDEConnectPacket:
     }
 
 
-could_send_my_id_packs = asyncio.Event()
+could_send_my_id_packs = True
 
 
 async def send_my_id_packets():
@@ -296,7 +294,9 @@ async def send_my_id_packets():
         a.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         while True:
-            await could_send_my_id_packs.wait()
+            if not could_send_my_id_packs:
+                await anyio.sleep(2)
+                continue
 
             await udp_sock.sendto(
                 prepare_to_send(id_pack), '<broadcast>',
@@ -340,7 +340,8 @@ async def wait_for_incoming_id(main_group:  anyio.abc.TaskGroup):
                 f'{dev_id} (IP: {host})'))
 
             # start connection task
-            main_group.start_soon(outgoing_connection_task, pack, host)
+            main_group.start_soon(outgoing_connection_task, pack, host,
+                                  main_group)
 
 
 async def outgoing_connection_task(
@@ -380,25 +381,97 @@ async def outgoing_connection_task(
 
         # receiving packets
         while True:
-            pack = receive_packet(bssock)
+            pack = await receive_packet(bssock)
             if not pack:
                 continue
 
-            # unpair packet
-            if pack['type'] == 'kdeconnect.pair' and not pack['body']['pair']:
-                dev_config.paired = False
-                dev_config.save()
-                await ssock.aclose()
-                log.info('Unpairing {dev_config.device_name} done.')
+            if not await handle_packet(pack, ssock, dev_config, remote_ip,
+                                       main_group):
+                break
+
+
+async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
+    """
+    Handles incoming connections.
+    """
+    async def handle_connection(client):
+        global could_send_my_id_packs
+        async with client:
+            could_send_my_id_packs = False  # block sending next ids
+
+            remote_ip, remote_port = client.extra(
+                anyio.abc.SocketAttribute.remote_address)
+            log.info(
+                f'New incoming connection {remote_ip}:{remote_port}')
+
+            # receive id packet
+            bsock = BufferedByteReceiveStream(client)
+            pack = await receive_packet(bsock)
+
+            if pack['type'] != 'kdeconnect.identity':
+                log.error(
+                    f'kdeconnect.identity packet expected, got {pack["type"]}')
+                could_send_my_id_packs = True
                 return
 
-            if pack['type'] == 'kdeconnect.share.request':
-                main_group.start_soon(download_file_task, pack, remote_ip,
-                                      dev_config.ssl_context(
-                                          ssl.Purpose.CLIENT_AUTH))
+            log.info((
+                'Incoming connection id packet received:'
+                f'{pack["body"]["deviceName"]} / {pack["body"]["deviceId"]}'))
+
+            # load device config
+            dev_config = DeviceConfig.load_from_id_pack(pack)
+            dev_config.last_connection_date = datetime.datetime.now()
+            dev_config.last_ip = remote_ip
+            dev_config.connected = True
+            dev_config.save()
+            CONNECTED_DEVICES.append(dev_config.device_id)
+
+            ssock = await TLSStream.wrap(client, server_side=False,
+                                         ssl_context=dev_config.ssl_context(
+                                             ssl.Purpose.SERVER_AUTH),
+                                         hostname=remote_ip)
+            log.debug('TLS connection wrapped.')
+
+            # try to obtain a device cert
+            try:
+                dev_config.certificate_PEM = ssl.DER_cert_to_PEM_cert(
+                    ssock.extra(
+                        anyio.streams.tls.TLSAttribute.peer_certificate_binary)
+                )
+                dev_config.ssl_context(renew=True)
+                dev_config.save()
+            except Exception:
+                log.exception(
+                    f'Error while retrieving certificate of {remote_ip}.')
+
+            # handle pair if needed
+            bssock = BufferedByteReceiveStream(ssock)
+            if not dev_config.paired:
+                if not await handle_pairing(ssock, bssock, dev_config):
+                    await ssock.aclose()
+                    could_send_my_id_packs = True
+                    return
+
+            # receive packets
+            while True:
+                pack = await receive_packet(bssock)
+                if not pack:
+                    continue
+
+                if not await handle_packet(pack, ssock, dev_config, remote_ip,
+                                           main_group):
+                    could_send_my_id_packs = True
+                    break
+
+    listener = await anyio.create_tcp_listener(
+        local_port=KDE_CONNECT_DEFAULT_PORT, local_host='0.0.0.0')
+    await listener.serve(handle_connection)
 
 
 async def receive_packet(bssock: BufferedByteReceiveStream):
+    """
+    Receiving and decoding a packet - the common part
+    """
     try:
         pack_data = await bssock.receive_until(b'\n', 1024 * 1024 * 10)
     except Exception:
@@ -411,13 +484,33 @@ async def receive_packet(bssock: BufferedByteReceiveStream):
         log.exception(f'Error while decoding packet\n{pack_data}')
         return False
 
-    log.debug(f'Received packet:\n{pack}')
+    log.debug(f'Received packet:\n{pack!r}')
 
     return pack
 
 
+async def handle_packet(pack, ssock, dev_config, remote_ip, main_group):
+    """
+    Common part of handling the incoming packet
+    """
+    # unpair packet
+    if pack['type'] == 'kdeconnect.pair' and not pack['body']['pair']:
+        dev_config.paired = False
+        dev_config.save()
+        await ssock.aclose()
+        log.info('Unpairing {dev_config.device_name} done.')
+        return False
+
+    # incoming file
+    if pack['type'] == 'kdeconnect.share.request':
+        main_group.start_soon(download_file_task, pack, remote_ip,
+                              dev_config.ssl_context(ssl.Purpose.CLIENT_AUTH))
+
+    return True
+
+
 auto_send_pair_request = False
-pair_request_auto_accept = False
+pair_request_auto_accept = True
 
 
 async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
@@ -448,6 +541,8 @@ async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
             dev_config.save()
             return False
 
+        if not pair_request_auto_accept:
+            pass
         # TODO: pytanie do użytkownika
 
         await ssock.send(prepare_to_send(pair_pack))
@@ -666,10 +761,10 @@ async def main():
               f'({PYCONNECT_DEVICE_ID})'))
 
     # main task
-    could_send_my_id_packs.set()
     async with anyio.create_task_group() as main_group:
         main_group.start_soon(signal_handler, main_group.cancel_scope)
         main_group.start_soon(wait_for_incoming_id, main_group)
+        main_group.start_soon(incoming_connection_task, main_group)
         main_group.start_soon(send_my_id_packets)
 
     log.info('Application end')
