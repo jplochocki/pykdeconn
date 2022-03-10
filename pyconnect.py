@@ -17,6 +17,7 @@ import uuid
 import subprocess
 
 import anyio
+from anyio.abc import SocketStream
 from anyio.streams.tls import TLSStream, TLSListener
 from anyio.streams.buffered import BufferedByteReceiveStream
 
@@ -99,6 +100,8 @@ CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'pyconnect.config.json')
 config = None
 
+auto_send_pair_request = False
+pair_request_auto_accept = True
 
 KDEConnectPacket = typing.Dict[str, typing.Any]
 
@@ -184,9 +187,17 @@ class DeviceConfig:
     @staticmethod
     def is_known_device(device_id: str) -> bool:
         """
-        Checks in the configuration whether the device ID is known.
+        Checks in configuration whether the device ID is known.
         """
         return 'devices' in config and device_id in config['devices']
+
+    @staticmethod
+    def is_paired_device(device_id: str) -> bool:
+        """
+        Checks in configuration whether the device is paired.
+        """
+        return config.get('devices', {}).get(device_id, {}).get(
+            'paired', False)
 
     @classmethod
     def load_from_id_pack(cls, pack: KDEConnectPacket):
@@ -203,11 +214,11 @@ class DeviceConfig:
                 f'Identity packet without body.deviceId\n{pack=}')
 
         if DeviceConfig.is_known_device(pack_body['deviceId']):
-            dev = DeviceConfig.load(pack_body['deviceId'])
+            dev = cls.load(pack_body['deviceId'])
             dev.device_name = pack_body['deviceName']
         else:
-            dev = DeviceConfig(device_id=pack_body['deviceId'],
-                               device_name=pack_body['deviceName'])
+            dev = cls(device_id=pack_body['deviceId'],
+                      device_name=pack_body['deviceName'])
 
         dev.save()
         return dev
@@ -290,8 +301,8 @@ async def send_my_id_packets():
             family=socket.AF_INET, reuse_port=True,
             local_port=KDE_CONNECT_DEFAULT_PORT) as udp_sock:
 
-        a = udp_sock.extra(anyio.abc.SocketAttribute.raw_socket)
-        a.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        raw_socket = udp_sock.extra(anyio.abc.SocketAttribute.raw_socket)
+        raw_socket.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
 
         while True:
             if not could_send_my_id_packs:
@@ -305,7 +316,7 @@ async def send_my_id_packets():
             await anyio.sleep(2)
 
 
-async def wait_for_incoming_id(main_group:  anyio.abc.TaskGroup):
+async def wait_for_incoming_id(main_group: anyio.abc.TaskGroup):
     """
     Listens on ``UDP Broadcast`` for incoming device ID packets.
     """
@@ -334,14 +345,18 @@ async def wait_for_incoming_id(main_group:  anyio.abc.TaskGroup):
                 continue
 
             dev_name = pack_body['deviceName']
-            known = 'known' if DeviceConfig.is_known_device(dev_id) else 'unknown'  # noqa
+            known = 'known' if DeviceConfig.is_known_device(dev_id) else \
+                'unknown'
+            paired = 'paired' if DeviceConfig.is_paired_device(dev_id) else \
+                'unpaired'
             log.debug((
-                f'Id packet received from {known} device: {dev_name} / '
-                f'{dev_id} (IP: {host})'))
+                f'Id packet received from {known} and {paired} device:'
+                f' {dev_name} / {dev_id} (IP: {host})'))
 
             # start connection task
-            main_group.start_soon(outgoing_connection_task, pack, host,
-                                  main_group)
+            if DeviceConfig.is_paired_device(dev_id):
+                main_group.start_soon(outgoing_connection_task, pack, host,
+                                      main_group)
 
 
 async def outgoing_connection_task(
@@ -351,14 +366,12 @@ async def outgoing_connection_task(
     Outgoing conection to the known device.
     """
     dev_config = DeviceConfig.load_from_id_pack(id_packet)
-
     remote_port = id_packet['body']['tcpPort']
 
     # connect
     async with await anyio.connect_tcp(remote_ip, remote_port) as sock:
-        log.info(
-            (f'Connected to {remote_ip}:{remote_port} '
-             f'({dev_config.device_name}).'))
+        log.info((f'Connected to {remote_ip}:{remote_port} '
+                  f'({dev_config.device_name}).'))
         CONNECTED_DEVICES.append(dev_config.device_id)
         dev_config.connected = True
 
@@ -369,24 +382,26 @@ async def outgoing_connection_task(
         # wrap TLS
         ssock = await TLSStream.wrap(
             sock, server_side=True, ssl_context=dev_config.ssl_context(
-                ssl.Purpose.CLIENT_AUTH))
+                ssl.Purpose.CLIENT_AUTH), standard_compatible=False)
         log.debug(f'Wrapped TLS connection with {remote_ip}:{remote_port}.')
 
         # handle pair if needed
         bssock = BufferedByteReceiveStream(ssock)
         if not dev_config.paired:
             if not await handle_pairing(ssock, bssock, dev_config):
-                await ssock.aclose()
+                await on_device_disconnected(dev_config, ssock)
                 return
 
         # receiving packets
         while True:
             pack = await receive_packet(bssock)
             if not pack:
+                await anyio.sleep(1)
                 continue
 
-            if not await handle_packet(pack, ssock, dev_config, remote_ip,
-                                       main_group):
+            if not await handle_packet(pack, ssock, bssock, dev_config,
+                                       remote_ip, main_group):
+                await on_device_disconnected(dev_config, ssock)
                 break
 
 
@@ -429,7 +444,8 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
             ssock = await TLSStream.wrap(client, server_side=False,
                                          ssl_context=dev_config.ssl_context(
                                              ssl.Purpose.SERVER_AUTH),
-                                         hostname=remote_ip)
+                                         hostname=remote_ip,
+                                         standard_compatible=False)
             log.debug('TLS connection wrapped.')
 
             # try to obtain a device cert
@@ -448,7 +464,7 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
             bssock = BufferedByteReceiveStream(ssock)
             if not dev_config.paired:
                 if not await handle_pairing(ssock, bssock, dev_config):
-                    await ssock.aclose()
+                    await on_device_disconnected(dev_config, ssock)
                     could_send_my_id_packs = True
                     return
 
@@ -456,10 +472,12 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
             while True:
                 pack = await receive_packet(bssock)
                 if not pack:
+                    await anyio.sleep(1)
                     continue
 
-                if not await handle_packet(pack, ssock, dev_config, remote_ip,
-                                           main_group):
+                if not await handle_packet(pack, ssock, bssock, dev_config,
+                                           remote_ip, main_group):
+                    await on_device_disconnected(dev_config, ssock)
                     could_send_my_id_packs = True
                     break
 
@@ -468,12 +486,15 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
     await listener.serve(handle_connection)
 
 
-async def receive_packet(bssock: BufferedByteReceiveStream):
+async def receive_packet(bssock: BufferedByteReceiveStream) -> typing.Union[
+        KDEConnectPacket, bool]:
     """
     Receiving and decoding a packet - the common part
     """
     try:
         pack_data = await bssock.receive_until(b'\n', 1024 * 1024 * 10)
+    except (anyio.EndOfStream, anyio.IncompleteRead):
+        return False
     except Exception:
         log.exception('Error while receiving packet.')
         return False
@@ -489,17 +510,25 @@ async def receive_packet(bssock: BufferedByteReceiveStream):
     return pack
 
 
-async def handle_packet(pack, ssock, dev_config, remote_ip, main_group):
+async def handle_packet(pack: KDEConnectPacket, ssock: typing.Union[
+        SocketStream, TLSStream], bssock: BufferedByteReceiveStream,
+        dev_config: DeviceConfig, remote_ip: str,
+        main_group: anyio.abc.TaskGroup) -> bool:
     """
     Common part of handling the incoming packet
     """
-    # unpair packet
-    if pack['type'] == 'kdeconnect.pair' and not pack['body']['pair']:
-        dev_config.paired = False
-        dev_config.save()
-        await ssock.aclose()
-        log.info('Unpairing {dev_config.device_name} done.')
-        return False
+    # pair / unpair packet
+    if pack['type'] == 'kdeconnect.pair':
+        if pack['body']['pair'] is False:
+            dev_config.paired = False
+            dev_config.save()
+            await on_device_disconnected(dev_config, ssock)
+            log.info('Unpairing {dev_config.device_name} done.')
+            return False
+        else:
+            # pair packet is possible, when we weren't properly unpaired before
+            return await handle_pairing(ssock, bssock, dev_config,
+                                        pair_pack_received=True)
 
     # incoming file
     if pack['type'] == 'kdeconnect.share.request':
@@ -509,12 +538,9 @@ async def handle_packet(pack, ssock, dev_config, remote_ip, main_group):
     return True
 
 
-auto_send_pair_request = False
-pair_request_auto_accept = True
-
-
 async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
-                         dev_config: DeviceConfig):
+                         dev_config: DeviceConfig,
+                         pair_pack_received: bool = False) -> bool:
     pair_pack = {
         'id': 0,
         'type': 'kdeconnect.pair',
@@ -528,22 +554,29 @@ async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
         pass
     else:
         # answer only the pair request
-        pack = await receive_packet(bssock)
-        if pack['type'] != 'kdeconnect.pair':
-            log.error((
-                'Unexpected packet type (expected kdeconnect.pair, got'
-                f' {pack["type"]}).\n{pack!r}'))
-            return False
+        if not pair_pack_received:
+            while True:
+                pack = await receive_packet(bssock)
+                if pack:
+                    break
+                else:
+                    await anyio.sleep(1)
+            if not pack or pack['type'] != 'kdeconnect.pair':
+                log.error((
+                    'Unexpected packet type (expected kdeconnect.pair, got'
+                    f' {pack["type"]}).\n{pack!r}'))
+                return False
 
-        if not pack['body']['pair']:
-            log.info('Unpairing {dev_config.device_name} done.')
-            dev_config.paired = False
-            dev_config.save()
-            return False
+            if not pack['body']['pair']:
+                log.info('Unpairing {dev_config.device_name} done.')
+                dev_config.paired = False
+                dev_config.save()
+                return False
 
         if not pair_request_auto_accept:
             pass
         # TODO: pytanie do użytkownika
+        # + dev_config.paired = True
 
         await ssock.send(prepare_to_send(pair_pack))
         dev_config.paired = True
@@ -552,17 +585,43 @@ async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
         return True
 
 
-async def download_file_task(pack, remote_ip, ssl_context):
-    log.info(f'download_file_task() from {remote_ip}')
+async def on_device_disconnected(dev_config: DeviceConfig,
+                                 anysock: typing.Union[
+                                     SocketStream, TLSStream] = None):
+    """
+    Device disconnection - the common code.
+    """
+    global could_send_my_id_packs
+
+    if anysock:
+        try:
+            await anysock.aclose()
+        except Exception:
+            log.exception('Exception while disconnecting - ignored.')
+            pass
+
+    dev_config.connected = False
+
+    if dev_config.device_id in CONNECTED_DEVICES:
+        del CONNECTED_DEVICES[CONNECTED_DEVICES.index(dev_config.device_id)]
+
+    could_send_my_id_packs = True
+
+
+async def download_file_task(pack: KDEConnectPacket, remote_ip: str,
+                             ssl_context: ssl.SSLContext):
+    """
+    File download initiated by packet kdeconnect.share.request.
+    """
+    log.info(f'Downloading file from {remote_ip}.')
 
     if 'filename' not in pack['body']:
-        log.error('download_file_task(): No filename property in pack.')
+        log.error('No filename property in pack.')
         return
 
     if 'payloadSize' not in pack or 'payloadTransferInfo' not in pack \
             or 'port' not in pack['payloadTransferInfo']:
-        log.error(('download_file_task(): No payloadSize or '
-                   'payloadTransferInfo property in pack.'))
+        log.error('No payloadSize or payloadTransferInfo property in pack.')
         return
 
     # dest filename
@@ -573,7 +632,7 @@ async def download_file_task(pack, remote_ip, ssl_context):
         filename = os.path.join(os.path.expanduser('~'),
                                 f'{filename[0]}-{i}{filename[1]}')
         i += 1
-    log.debug(f'download_file_task(): destination file: {filename}')
+    log.debug(f'Download destination file: {filename}.')
 
     # download
     async with await anyio.connect_tcp(
@@ -586,37 +645,36 @@ async def download_file_task(pack, remote_ip, ssl_context):
                 data = await sock.receive()
                 f.write(data)
                 received += len(data)
-                print((f'\r* download_file_task(): {pack["body"]["filename"]}'
-                       f' - received bytes  +{len(data)} ({received} of'
-                       f' {pack["payloadSize"]})'),
-                      end='')
+                print((
+                    f'\r* Download {pack["body"]["filename"]} - received bytes'
+                    f'  +{len(data)} ({received} of {pack["payloadSize"]})'),
+                    end='')
         print('')
 
-    log.info('download_file_task(): download connection closed.')
+    log.info(f'Download connection closed with {remote_ip}.')
 
 
-async def test_upload_task(ssock, ssl_context):
-    '''
-    Test upload task - upload script itself
-    '''
-    await anyio.sleep(2)
-    await upload_file(os.path.abspath(__file__), ssock, ssl_context)
-
-
-async def upload_file(file_path, ssock, ssl_context):
-    log.info(f'upload_file(): {file_path=}, {ssock=}, {ssl_context=}')
-
+async def upload_file_task(file_path: str, ssock: TLSStream,
+                           ssl_context: ssl.SSLContext):
+    """
+    Upload file task.
+    """
     if not os.path.exists(file_path):
-        log.error(f'upload_file(): File not exists ({file_path})')
+        log.error(f'File not exists ({file_path}).')
         return
 
     # start upload server
     file_size = os.path.getsize(file_path)
+    file_name = os.path.basename(file_path)
     server = None
     close_server_event = anyio.Event()
 
     async def handle_connection(sock_client):
         async with sock_client:
+            remote_ip, remote_port = sock_client.extra(
+                anyio.abc.SocketAttribute.remote_address)
+            log.info(
+                f'Upload file {file_name} - device connected ({remote_ip}).')
             with open(file_path, 'rb') as f:
                 sent = 0
                 while sent < file_size:
@@ -624,8 +682,9 @@ async def upload_file(file_path, ssock, ssl_context):
                     await sock_client.send(data)
 
                     sent += len(data)
-                    print((f'\rupload_file() sent {sent} of {file_size} '
-                           f'(+{len(data)})'), end='')
+                    print((
+                        f'\r* Upload file {file_name} - sent {sent} of '
+                        f'{file_size} (+{len(data)})'), end='')
         print('')
 
         await server.aclose()
@@ -637,20 +696,21 @@ async def upload_file(file_path, ssock, ssl_context):
             server = TLSListener(await anyio.create_tcp_listener(
                 local_port=port, local_host='0.0.0.0'),
                 ssl_context=ssl_context, standard_compatible=False)
-            log.info(f'upload_file(): - Selected port {port}')
+            log.debug(f'Selected port {port} for upload file.')
             transfer_port = port
 
             break
         except OSError as e:
-            if e.errno == 98:  # port already in use
+            if e.errno == 98:  # port already in use - ignore
                 continue
             raise e
 
-    # # send ready packet
+    # send ready packet
     pack = {
+        'id': 0,
         'type': 'kdeconnect.share.request',
         'body': {
-            'filename': os.path.basename(file_path),
+            'filename': file_name,
             'open': False,
             'lastModified': int(os.path.getmtime(file_path)),
             'numberOfFiles': 1,
@@ -666,7 +726,7 @@ async def upload_file(file_path, ssock, ssl_context):
     await anyio.sleep(0.01)
 
     await ssock.send(prepare_to_send(pack))
-    log.debug(f'upload_file(): invitation packet sent: {pack!r}')
+    log.debug(f'Upload invitation packet sent: {pack!r}.')
 
     try:
         await serve_forever
@@ -674,7 +734,7 @@ async def upload_file(file_path, ssock, ssl_context):
         close_server_event.set()
 
     await close_server_event.wait()
-    log.debug('upload_file(): transfer server closed')
+    log.debug('Transfer server closed.')
 
 
 async def signal_handler(scope: anyio.CancelScope):
@@ -737,10 +797,10 @@ async def read_cert_common_name(cert_file: str) -> str:
 
 
 async def main():
-    # config
     global config, PYCONNECT_CERTFILE, PYCONNECT_KEYFILE, PYCONNECT_DEVICE_ID,\
         PYCONNECT_DEVICE_NAME
 
+    # config
     load_config()
 
     # init certs
