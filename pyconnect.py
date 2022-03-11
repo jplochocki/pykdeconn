@@ -21,6 +21,12 @@ from anyio.abc import SocketStream
 from anyio.streams.tls import TLSStream, TLSListener
 from anyio.streams.buffered import BufferedByteReceiveStream
 
+import ravel
+import dbussy
+from dbussy import DBUS
+
+import click
+
 
 class CustomFormatter(logging.Formatter):
     grey = '\x1b[38;20m'
@@ -74,6 +80,12 @@ logging.config.dictConfig({
 
 
 log = logging.getLogger('pyconnect.detailed_log')
+
+
+DBUS_IFACE_SERVER = 'io.github.jplochocki.pyconnect'
+DBUS_IFACE_SERVER_PATH = '/io/github/jplochocki/pyconnect'
+DBUS_IFACE_CLIENT = 'io.github.jplochocki.pyconnect.client'
+DBUS_IFACE_CLIENT_PATH = '/io/github/jplochocki/pyconnect/client'
 
 
 KDE_CONNECT_DEFAULT_PORT = 1716
@@ -796,7 +808,51 @@ async def read_cert_common_name(cert_file: str) -> str:
     return a.group(1)
 
 
-async def main():
+@ravel.interface(ravel.INTERFACE.SERVER, name=DBUS_IFACE_SERVER)
+class DBUSCallbackServer:
+    def __init__(self):
+        pass
+
+    @ravel.method(
+        name='status',
+        in_signature='',
+        out_signature='s',
+      )
+    async def handle_status(self):
+        status = {
+            'running': True,
+            'connected': False,
+            'devices': []
+        }
+
+        for dev_id in CONNECTED_DEVICES:
+            status['connected'] = True
+            dev_config = DeviceConfig.load(dev_id)
+
+            status['devices'].append({
+                'device_id': dev_id,
+                'device_name': dev_config.device_name,
+                'device_paired': dev_config.paired,
+                'device_ip': dev_config.last_ip,
+                'connected_since':
+                    datetime.datetime.now() - dev_config.last_connection_date,
+            })
+
+        log.debug(f'Service status result = {status!r}')
+        return [json.dumps(status, cls=EnhancedJSONEncoder)]
+
+    @ravel.method(
+        name='upload_file',
+        in_signature='as',
+        arg_keys=('file_paths',),
+        out_signature='b',
+      )
+    async def handle_upload_file(self, file_paths):
+        log.info(f'handle_upload_file(): DBUS call {file_paths=}')
+        return [True]
+
+
+async def server_main_task():
     global config, PYCONNECT_CERTFILE, PYCONNECT_KEYFILE, PYCONNECT_DEVICE_ID,\
         PYCONNECT_DEVICE_NAME
 
@@ -817,8 +873,17 @@ async def main():
     if not PYCONNECT_DEVICE_ID:
         PYCONNECT_DEVICE_ID = await read_cert_common_name(PYCONNECT_CERTFILE)
 
-    log.info((f'PYConnect starts as {PYCONNECT_DEVICE_NAME} '
+    log.info((f'PYConnect server starts as {PYCONNECT_DEVICE_NAME} '
               f'({PYCONNECT_DEVICE_ID})'))
+
+    # dbus
+    dbus = ravel.session_bus()
+    dbus.attach_asyncio()
+    dbus.request_name(bus_name=DBUS_IFACE_SERVER,
+                      flags=DBUS.NAME_FLAG_DO_NOT_QUEUE)
+    dbus_interface = DBUSCallbackServer()
+    dbus.register(path=DBUS_IFACE_SERVER_PATH, fallback=True,
+                  interface=dbus_interface)
 
     # main task
     async with anyio.create_task_group() as main_group:
@@ -827,8 +892,72 @@ async def main():
         main_group.start_soon(incoming_connection_task, main_group)
         main_group.start_soon(send_my_id_packets)
 
-    log.info('Application end')
+    log.info('Server ends.')
+
+
+async def fetch_server_status(dbus):
+    request = dbussy.Message.new_method_call(
+        destination=DBUS_IFACE_SERVER, path=DBUS_IFACE_SERVER_PATH,
+        iface=DBUS_IFACE_SERVER, method='status')
+    reply = await dbus.connection.send_await_reply(request)
+
+    # print(reply, dbussy.Message.type_to_string(reply.type),)
+    if reply.type == DBUS.MESSAGE_TYPE_ERROR:
+        if reply.error_name == 'org.freedesktop.DBus.Error.ServiceUnknown':
+            log.error('You must run "pyconnect.py service" first.')
+        else:
+            log.error((f'Error occurred while method call.\n{reply.error_name}'
+                       f' = {reply.all_objects!r}'))
+        return {
+            'running': False,
+            'connected': False,
+            'devices': []
+        }
+
+    return json.loads(reply.all_objects[0], cls=EnhancedJSONDecoder)
+
+
+async def handle_status_command(server_status):
+
+    sys.exit(0)
+
+
+async def client_main_task(command_name: str, command_args: typing.List):
+    dbus = ravel.session_bus()
+    dbus.attach_asyncio()
+
+    server_status = await fetch_server_status(dbus)
+
+    async with anyio.create_task_group() as main_group:
+        main_group.start_soon(signal_handler, main_group.cancel_scope)
+
+        main_group.start_soon({
+            'status': handle_status_command,
+        }.get(command_name), server_status, *command_args)
+
+
+@click.group()
+def main():
+    pass
+
+
+@main.command()
+def status():
+    anyio.run(client_main_task, 'status', [])
+
+
+@main.command()
+@click.argument('filenames', type=click.Path(exists=True), nargs=-1,
+                required=True)
+def upload(filenames):
+    print(filenames)
+    anyio.run(client_main_task, '', [])
+
+
+@main.command()
+def server():
+    anyio.run(server_main_task)
 
 
 if __name__ == '__main__':
-    anyio.run(main)
+    main()
