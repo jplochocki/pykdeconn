@@ -83,9 +83,9 @@ log = logging.getLogger('pyconnect.detailed_log')
 
 
 DBUS_IFACE_SERVER = 'io.github.jplochocki.pyconnect'
-DBUS_IFACE_SERVER_PATH = '/io/github/jplochocki/pyconnect'
+DBUS_SERVER_PATH = '/'
 DBUS_IFACE_CLIENT = 'io.github.jplochocki.pyconnect.client'
-DBUS_IFACE_CLIENT_PATH = '/io/github/jplochocki/pyconnect/client'
+DBUS_CLIENT_PATH = '/'
 
 
 KDE_CONNECT_DEFAULT_PORT = 1716
@@ -105,8 +105,6 @@ PYCONNECT_OUTGOING_CAPABILITIES = [
 
 PYCONNECT_CERTFILE = None
 PYCONNECT_KEYFILE = None
-
-CONNECTED_DEVICES = []
 
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                            'pyconnect.config.json')
@@ -192,9 +190,31 @@ class DeviceConfig:
     last_connection_date: datetime.datetime = field(
         default_factory=lambda: datetime.datetime.now())
 
+    _cache: typing.ClassVar = {}
+
     def __post_init__(self):
         self._ssl_cnx_cache = {}
-        self.connected = False
+        self._connected = False
+        self.connection_ssock = None
+
+        DeviceConfig._cache[self.device_id] = self
+
+    @property
+    def connected(self) -> bool:
+        return self._connected
+
+    @connected.setter
+    def connected(self, v: bool) -> None:
+        self._connected = v
+
+        if v:
+            DeviceConfig._cache[self.device_id] = self
+            self.last_connection_date = datetime.datetime.now()
+            self.save()
+        else:
+            self.connection_ssock = None
+            if self.device_id in DeviceConfig._cache:
+                del DeviceConfig._cache[self.device_id]
 
     @staticmethod
     def is_known_device(device_id: str) -> bool:
@@ -202,6 +222,15 @@ class DeviceConfig:
         Checks in configuration whether the device ID is known.
         """
         return 'devices' in config and device_id in config['devices']
+
+    @staticmethod
+    def is_connected_device(device_id: str) -> bool:
+        """
+        Checks by ID whether the device is connected.
+        """
+        if device_id not in DeviceConfig._cache:
+            return False
+        return DeviceConfig._cache[device_id].connected
 
     @staticmethod
     def is_paired_device(device_id: str) -> bool:
@@ -225,6 +254,9 @@ class DeviceConfig:
             raise RuntimeError(
                 f'Identity packet without body.deviceId\n{pack=}')
 
+        if pack_body['deviceId'] in DeviceConfig._cache:
+            return DeviceConfig._cache[pack_body['deviceId']]
+
         if DeviceConfig.is_known_device(pack_body['deviceId']):
             dev = cls.load(pack_body['deviceId'])
             dev.device_name = pack_body['deviceName']
@@ -237,13 +269,21 @@ class DeviceConfig:
 
     @classmethod
     def load(cls, device_id: str):
-        """Loads device config."""
+        """
+        Loads device config.
+        """
+        if device_id in DeviceConfig._cache:
+            return DeviceConfig._cache[device_id]
+
         if 'devices' in config and device_id in config['devices']:
             return cls(**config['devices'][device_id])
+
         raise RuntimeError(f'Device id "{device_id}" not  configured.')
 
     def save(self):
-        """Saves device config."""
+        """
+        Saves device config.
+        """
         if 'devices' not in config:
             config['devices'] = {}
 
@@ -252,7 +292,9 @@ class DeviceConfig:
 
     def ssl_context(self, purpose: ssl.Purpose = ssl.Purpose.CLIENT_AUTH,
                     renew: bool = False) -> ssl.SSLContext:
-        """Loads ``SSLContext`` for the specified ``purpose``."""
+        """
+        Loads ``SSLContext`` for the specified ``purpose``.
+        """
         if not renew and purpose.shortname in self._ssl_cnx_cache:
             return self._ssl_cnx_cache[purpose.shortname]
 
@@ -353,7 +395,7 @@ async def wait_for_incoming_id(main_group: anyio.abc.TaskGroup):
                 continue
 
             dev_id = pack_body['deviceId']
-            if dev_id == PYCONNECT_DEVICE_ID or dev_id in CONNECTED_DEVICES:
+            if dev_id == PYCONNECT_DEVICE_ID or DeviceConfig.is_connected_device(dev_id):  # noqa
                 continue
 
             dev_name = pack_body['deviceName']
@@ -377,6 +419,8 @@ async def outgoing_connection_task(
     """
     Outgoing conection to the known device.
     """
+    global could_send_my_id_packs
+
     dev_config = DeviceConfig.load_from_id_pack(id_packet)
     remote_port = id_packet['body']['tcpPort']
 
@@ -384,8 +428,8 @@ async def outgoing_connection_task(
     async with await anyio.connect_tcp(remote_ip, remote_port) as sock:
         log.info((f'Connected to {remote_ip}:{remote_port} '
                   f'({dev_config.device_name}).'))
-        CONNECTED_DEVICES.append(dev_config.device_id)
         dev_config.connected = True
+        could_send_my_id_packs = False
 
         # send identity
         await sock.send(prepare_to_send(generate_my_identity()))
@@ -395,13 +439,15 @@ async def outgoing_connection_task(
         ssock = await TLSStream.wrap(
             sock, server_side=True, ssl_context=dev_config.ssl_context(
                 ssl.Purpose.CLIENT_AUTH), standard_compatible=False)
+        dev_config.connection_ssock = ssock
         log.debug(f'Wrapped TLS connection with {remote_ip}:{remote_port}.')
 
         # handle pair if needed
         bssock = BufferedByteReceiveStream(ssock)
         if not dev_config.paired:
-            if not await handle_pairing(ssock, bssock, dev_config):
+            if not await handle_pairing(dev_config, bssock):
                 await on_device_disconnected(dev_config, ssock)
+                could_send_my_id_packs = True
                 return
 
         # receiving packets
@@ -411,10 +457,11 @@ async def outgoing_connection_task(
                 await anyio.sleep(1)
                 continue
 
-            if not await handle_packet(pack, ssock, bssock, dev_config,
-                                       remote_ip, main_group):
+            if not await handle_packet(dev_config, pack, bssock, main_group):
                 await on_device_disconnected(dev_config, ssock)
                 break
+
+        could_send_my_id_packs = True
 
 
 async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
@@ -445,19 +492,24 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
                 'Incoming connection id packet received:'
                 f'{pack["body"]["deviceName"]} / {pack["body"]["deviceId"]}'))
 
+            # disconnect already connected device
+            if DeviceConfig.is_connected_device(pack['body']['deviceId']):
+                await client.aclose()
+                could_send_my_id_packs = True
+                return
+
             # load device config
             dev_config = DeviceConfig.load_from_id_pack(pack)
-            dev_config.last_connection_date = datetime.datetime.now()
             dev_config.last_ip = remote_ip
             dev_config.connected = True
             dev_config.save()
-            CONNECTED_DEVICES.append(dev_config.device_id)
 
             ssock = await TLSStream.wrap(client, server_side=False,
                                          ssl_context=dev_config.ssl_context(
                                              ssl.Purpose.SERVER_AUTH),
                                          hostname=remote_ip,
                                          standard_compatible=False)
+            dev_config.connection_ssock = ssock
             log.debug('TLS connection wrapped.')
 
             # try to obtain a device cert
@@ -475,7 +527,7 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
             # handle pair if needed
             bssock = BufferedByteReceiveStream(ssock)
             if not dev_config.paired:
-                if not await handle_pairing(ssock, bssock, dev_config):
+                if not await handle_pairing(dev_config, bssock):
                     await on_device_disconnected(dev_config, ssock)
                     could_send_my_id_packs = True
                     return
@@ -487,11 +539,13 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
                     await anyio.sleep(1)
                     continue
 
-                if not await handle_packet(pack, ssock, bssock, dev_config,
-                                           remote_ip, main_group):
+                if not await handle_packet(dev_config, pack, bssock,
+                                           main_group):
                     await on_device_disconnected(dev_config, ssock)
                     could_send_my_id_packs = True
                     break
+
+            could_send_my_id_packs = True
 
     listener = await anyio.create_tcp_listener(
         local_port=KDE_CONNECT_DEFAULT_PORT, local_host='0.0.0.0')
@@ -522,10 +576,9 @@ async def receive_packet(bssock: BufferedByteReceiveStream) -> typing.Union[
     return pack
 
 
-async def handle_packet(pack: KDEConnectPacket, ssock: typing.Union[
-        SocketStream, TLSStream], bssock: BufferedByteReceiveStream,
-        dev_config: DeviceConfig, remote_ip: str,
-        main_group: anyio.abc.TaskGroup) -> bool:
+async def handle_packet(dev_config: DeviceConfig, pack: KDEConnectPacket,
+                        bssock: BufferedByteReceiveStream,
+                        main_group: anyio.abc.TaskGroup) -> bool:
     """
     Common part of handling the incoming packet
     """
@@ -534,25 +587,28 @@ async def handle_packet(pack: KDEConnectPacket, ssock: typing.Union[
         if pack['body']['pair'] is False:
             dev_config.paired = False
             dev_config.save()
-            await on_device_disconnected(dev_config, ssock)
+            await on_device_disconnected(dev_config,
+                                         dev_config.connection_ssock)
             log.info('Unpairing {dev_config.device_name} done.')
             return False
         else:
             # pair packet is possible, when we weren't properly unpaired before
-            return await handle_pairing(ssock, bssock, dev_config,
+            return await handle_pairing(dev_config, bssock,
                                         pair_pack_received=True)
 
     # incoming file
     if pack['type'] == 'kdeconnect.share.request':
-        main_group.start_soon(download_file_task, pack, remote_ip,
-                              dev_config.ssl_context(ssl.Purpose.CLIENT_AUTH))
+        main_group.start_soon(download_file_task, pack, dev_config)
 
     return True
 
 
-async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
-                         dev_config: DeviceConfig,
-                         pair_pack_received: bool = False) -> bool:
+async def handle_pairing(
+        dev_config: DeviceConfig, bssock: BufferedByteReceiveStream,
+        pair_pack_received: bool = False) -> bool:
+    """
+    Common part of device pairing.
+    """
     pair_pack = {
         'id': 0,
         'type': 'kdeconnect.pair',
@@ -590,7 +646,7 @@ async def handle_pairing(ssock: TLSStream, bssock: BufferedByteReceiveStream,
         # TODO: pytanie do użytkownika
         # + dev_config.paired = True
 
-        await ssock.send(prepare_to_send(pair_pack))
+        await dev_config.connection_ssock.send(prepare_to_send(pair_pack))
         dev_config.paired = True
         dev_config.save()
         log.info('Pairing {dev_config.device_name} done.')
@@ -614,18 +670,14 @@ async def on_device_disconnected(dev_config: DeviceConfig,
 
     dev_config.connected = False
 
-    if dev_config.device_id in CONNECTED_DEVICES:
-        del CONNECTED_DEVICES[CONNECTED_DEVICES.index(dev_config.device_id)]
-
     could_send_my_id_packs = True
 
 
-async def download_file_task(pack: KDEConnectPacket, remote_ip: str,
-                             ssl_context: ssl.SSLContext):
+async def download_file_task(pack: KDEConnectPacket, dev_config: DeviceConfig):
     """
     File download initiated by packet kdeconnect.share.request.
     """
-    log.info(f'Downloading file from {remote_ip}.')
+    log.info(f'Downloading file from {dev_config.last_ip}.')
 
     if 'filename' not in pack['body']:
         log.error('No filename property in pack.')
@@ -648,13 +700,13 @@ async def download_file_task(pack: KDEConnectPacket, remote_ip: str,
 
     # download
     async with await anyio.connect_tcp(
-            remote_ip, pack['payloadTransferInfo']['port'],
-            ssl_context=ssl_context) as sock:
-
+            dev_config.last_ip, pack['payloadTransferInfo']['port'],
+            ssl_context=dev_config.ssl_context(
+                ssl.Purpose.SERVER_AUTH)) as ssock:
         with open(filename, 'wb') as f:
             received = 0
             while received < pack['payloadSize']:
-                data = await sock.receive()
+                data = await ssock.receive()
                 f.write(data)
                 received += len(data)
                 print((
@@ -663,11 +715,12 @@ async def download_file_task(pack: KDEConnectPacket, remote_ip: str,
                     end='')
         print('')
 
-    log.info(f'Download connection closed with {remote_ip}.')
+    log.info(f'Download connection closed with {dev_config.last_ip}.')
 
 
-async def upload_file_task(file_path: str, ssock: TLSStream,
-                           ssl_context: ssl.SSLContext):
+async def upload_file_task(
+        dev_config: DeviceConfig, file_path: str, number_of_files: int = 1,
+        total_files_size: int = -1):
     """
     Upload file task.
     """
@@ -707,7 +760,8 @@ async def upload_file_task(file_path: str, ssock: TLSStream,
         try:
             server = TLSListener(await anyio.create_tcp_listener(
                 local_port=port, local_host='0.0.0.0'),
-                ssl_context=ssl_context, standard_compatible=False)
+                ssl_context=dev_config.ssl_context(ssl.Purpose.CLIENT_AUTH),
+                standard_compatible=False)
             log.debug(f'Selected port {port} for upload file.')
             transfer_port = port
 
@@ -718,6 +772,8 @@ async def upload_file_task(file_path: str, ssock: TLSStream,
             raise e
 
     # send ready packet
+    total_size = total_files_size if total_files_size != -1 else file_size
+
     pack = {
         'id': 0,
         'type': 'kdeconnect.share.request',
@@ -725,8 +781,8 @@ async def upload_file_task(file_path: str, ssock: TLSStream,
             'filename': file_name,
             'open': False,
             'lastModified': int(os.path.getmtime(file_path)),
-            'numberOfFiles': 1,
-            'totalPayloadSize': file_size
+            'numberOfFiles': number_of_files,
+            'totalPayloadSize': total_size
         },
         'payloadSize': file_size,
         'payloadTransferInfo': {
@@ -737,7 +793,7 @@ async def upload_file_task(file_path: str, ssock: TLSStream,
     serve_forever = server.serve(handle_connection)
     await anyio.sleep(0.01)
 
-    await ssock.send(prepare_to_send(pack))
+    await dev_config.connection_ssock.send(prepare_to_send(pack))
     log.debug(f'Upload invitation packet sent: {pack!r}.')
 
     try:
@@ -825,12 +881,11 @@ class DBUSCallbackServer:
             'devices': []
         }
 
-        for dev_id in CONNECTED_DEVICES:
+        for dev_config in DeviceConfig._cache.values():
             status['connected'] = True
-            dev_config = DeviceConfig.load(dev_id)
 
             status['devices'].append({
-                'device_id': dev_id,
+                'device_id': dev_config.device_id,
                 'device_name': dev_config.device_name,
                 'device_paired': dev_config.paired,
                 'device_ip': dev_config.last_ip,
@@ -843,12 +898,20 @@ class DBUSCallbackServer:
 
     @ravel.method(
         name='upload_file',
-        in_signature='as',
-        arg_keys=('file_paths',),
+        in_signature='sas',
+        arg_keys=('device_id', 'file_paths',),
         out_signature='b',
       )
-    async def handle_upload_file(self, file_paths):
+    async def handle_upload_file(self, device_id, file_paths):
         log.info(f'handle_upload_file(): DBUS call {file_paths=}')
+
+        dev_config = DeviceConfig.load(device_id)
+        total_files_size = sum([os.path.getsize(f) for f in file_paths])
+
+        for file_path in file_paths:
+            await upload_file_task(dev_config, file_path, len(file_paths),
+                                   total_files_size)
+
         return [True]
 
 
@@ -882,7 +945,7 @@ async def server_main_task():
     dbus.request_name(bus_name=DBUS_IFACE_SERVER,
                       flags=DBUS.NAME_FLAG_DO_NOT_QUEUE)
     dbus_interface = DBUSCallbackServer()
-    dbus.register(path=DBUS_IFACE_SERVER_PATH, fallback=True,
+    dbus.register(path=DBUS_SERVER_PATH, fallback=True,
                   interface=dbus_interface)
 
     # main task
@@ -897,14 +960,14 @@ async def server_main_task():
 
 async def fetch_server_status(dbus):
     request = dbussy.Message.new_method_call(
-        destination=DBUS_IFACE_SERVER, path=DBUS_IFACE_SERVER_PATH,
+        destination=DBUS_IFACE_SERVER, path=DBUS_SERVER_PATH,
         iface=DBUS_IFACE_SERVER, method='status')
     reply = await dbus.connection.send_await_reply(request)
 
     # print(reply, dbussy.Message.type_to_string(reply.type),)
     if reply.type == DBUS.MESSAGE_TYPE_ERROR:
         if reply.error_name == 'org.freedesktop.DBus.Error.ServiceUnknown':
-            log.error('You must run "pyconnect.py service" first.')
+            log.debug('You must run "pyconnect.py server" first.')
         else:
             log.error((f'Error occurred while method call.\n{reply.error_name}'
                        f' = {reply.all_objects!r}'))
@@ -917,9 +980,81 @@ async def fetch_server_status(dbus):
     return json.loads(reply.all_objects[0], cls=EnhancedJSONDecoder)
 
 
-async def handle_status_command(server_status):
+def human_readable_timedelta(td: datetime.timedelta):
+    hours, remainder = divmod(int(td.total_seconds()), 3600)
+    minutes, seconds = divmod(remainder, 60)
 
-    sys.exit(0)
+    if hours == 0:
+        hours = ''
+    elif hours == 1:
+        hours = f'{hours} hour '
+    else:
+        hours = f'{hours} hours '
+
+    if minutes == 0:
+        minutes = ''
+    elif minutes == 1:
+        minutes = f'{minutes} minute '
+    else:
+        minutes = f'{minutes} minutes '
+
+    if seconds == 0:
+        seconds = ''
+    elif seconds == 1:
+        seconds = f'{seconds} second'
+    else:
+        seconds = f'{seconds} seconds'
+
+    return f'{hours}{minutes}{seconds}'
+
+
+async def handle_status_command(server_status: typing.Dict,
+                                scope: anyio.CancelScope,
+                                dbus: ravel.Connection):
+    """
+    Status command.
+    """
+    if not server_status['running']:
+        print(click.style(
+            '❌ Server unavailable. Run it typing pyconnect.py server.',
+            fg='red'))
+        scope.cancel()
+        return
+
+    print(click.style('✔️  Server running', fg='green'))
+    for device in server_status['devices']:
+        paired = '✔️' if ['device_paired'] else '❌'
+        paired_end = '' if ['device_paired'] else click.style(
+            ' - device unpaired', fg='red')
+        dev_name = click.style(device['device_name'], bold=True, fg='blue')
+        c_time = human_readable_timedelta(device['connected_since'])
+
+        print((f'{paired}  Connected with {dev_name} ({device["device_id"]} '
+               f'/ {device["device_ip"]}) since {c_time}{paired_end}'))
+
+    if not len(server_status['devices']):
+        print(click.style('❌ No device connected.', fg='red'))
+
+    scope.cancel()
+
+
+async def handle_upload_command(
+        server_status: typing.Dict, filenames: typing.List,
+        scope: anyio.CancelScope, dbus: ravel.Connection):
+    """
+    Upload file command.
+    """
+    request = dbussy.Message.new_method_call(
+        destination=DBUS_IFACE_SERVER, path=DBUS_SERVER_PATH,
+        iface=DBUS_IFACE_SERVER, method='upload_file')
+    request.append_objects('s', server_status['devices'][0]['device_id'])
+    request.append_objects('as', filenames)
+    reply = await dbus.connection.send_await_reply(request)
+
+    if reply.type == DBUS.MESSAGE_TYPE_ERROR:
+        log.error((f'Error occurred while method call.\n{reply.error_name}'
+                   f' = {reply.all_objects!r}'))
+    scope.cancel()
 
 
 async def client_main_task(command_name: str, command_args: typing.List):
@@ -927,13 +1062,19 @@ async def client_main_task(command_name: str, command_args: typing.List):
     dbus.attach_asyncio()
 
     server_status = await fetch_server_status(dbus)
+    if not server_status['connected'] and command_name in ['upload']:
+        print(click.style(
+            '❌ Command unavailable without any device connected.', fg='red'))
+        return
 
     async with anyio.create_task_group() as main_group:
         main_group.start_soon(signal_handler, main_group.cancel_scope)
 
         main_group.start_soon({
             'status': handle_status_command,
-        }.get(command_name), server_status, *command_args)
+            'upload': handle_upload_command,
+        }.get(command_name), server_status, *command_args,
+            main_group.cancel_scope, dbus)
 
 
 @click.group()
@@ -950,8 +1091,7 @@ def status():
 @click.argument('filenames', type=click.Path(exists=True), nargs=-1,
                 required=True)
 def upload(filenames):
-    print(filenames)
-    anyio.run(client_main_task, '', [])
+    anyio.run(client_main_task, 'upload', [filenames])
 
 
 @main.command()
