@@ -81,9 +81,9 @@ logging.config.dictConfig({
 
 log = logging.getLogger('pyconnect.detailed_log')
 
-
-DBUS_IFACE_SERVER = 'io.github.jplochocki.pyconnect'
-DBUS_SERVER_PATH = '/'
+PYCONNECT_SERVER_DBUS_NAME = 'io.github.jplochocki.pyconnect'
+PYCONNECT_SERVER_IFACE_NAME = 'io.github.jplochocki.pyconnect'
+# SERVER_DBUS_PATH = '/'
 DBUS_IFACE_CLIENT = 'io.github.jplochocki.pyconnect.client'
 DBUS_CLIENT_PATH = '/'
 
@@ -864,10 +864,34 @@ async def read_cert_common_name(cert_file: str) -> str:
     return a.group(1)
 
 
-@ravel.interface(ravel.INTERFACE.SERVER, name=DBUS_IFACE_SERVER)
+@ravel.interface(ravel.INTERFACE.SERVER, name=PYCONNECT_SERVER_IFACE_NAME)
 class DBUSCallbackServer:
     def __init__(self):
         pass
+
+    @ravel.propgetter(
+        name='is_connected_and_paired',
+        type=dbussy.BasicType(dbussy.TYPE.BOOLEAN),
+        # path_keyword="object_path", object_path
+        change_notification=dbussy.Introspection.PROP_CHANGE_NOTIFICATION.CONST,  # noqa
+    )
+    async def get_is_connected_and_paired(self):
+        for dev_config in DeviceConfig._cache.values():
+            if dev_config.paired:
+                return True
+        return False
+
+    @ravel.propgetter(
+        name='first_connected_and_paired',
+        type=dbussy.BasicType(dbussy.TYPE.STRING),
+        # path_keyword="object_path", object_path
+        change_notification=dbussy.Introspection.PROP_CHANGE_NOTIFICATION.CONST,  # noqa
+    )
+    async def get_first_connected_and_paired(self):
+        for dev_config in DeviceConfig._cache.values():
+            if dev_config.paired:
+                return dev_config.device_id
+        return ''
 
     @ravel.method(
         name='status',
@@ -942,11 +966,10 @@ async def server_main_task():
     # dbus
     dbus = ravel.session_bus()
     dbus.attach_asyncio()
-    dbus.request_name(bus_name=DBUS_IFACE_SERVER,
+    dbus.request_name(bus_name=PYCONNECT_SERVER_DBUS_NAME,
                       flags=DBUS.NAME_FLAG_DO_NOT_QUEUE)
     dbus_interface = DBUSCallbackServer()
-    dbus.register(path=DBUS_SERVER_PATH, fallback=True,
-                  interface=dbus_interface)
+    dbus.register(path='/', fallback=True, interface=dbus_interface)
 
     # main task
     async with anyio.create_task_group() as main_group:
@@ -960,8 +983,8 @@ async def server_main_task():
 
 async def fetch_server_status(dbus):
     request = dbussy.Message.new_method_call(
-        destination=DBUS_IFACE_SERVER, path=DBUS_SERVER_PATH,
-        iface=DBUS_IFACE_SERVER, method='status')
+        destination=PYCONNECT_SERVER_DBUS_NAME, path='/',
+        iface=PYCONNECT_SERVER_IFACE_NAME, method='status')
     reply = await dbus.connection.send_await_reply(request)
 
     # print(reply, dbussy.Message.type_to_string(reply.type),)
@@ -1045,8 +1068,8 @@ async def handle_upload_command(
     Upload file command.
     """
     request = dbussy.Message.new_method_call(
-        destination=DBUS_IFACE_SERVER, path=DBUS_SERVER_PATH,
-        iface=DBUS_IFACE_SERVER, method='upload_file')
+        destination=PYCONNECT_SERVER_DBUS_NAME, path='/',
+        iface=PYCONNECT_SERVER_IFACE_NAME, method='upload_file')
     request.append_objects('s', server_status['devices'][0]['device_id'])
     request.append_objects('as', filenames)
     reply = await dbus.connection.send_await_reply(request)
@@ -1060,6 +1083,15 @@ async def handle_upload_command(
 async def client_main_task(command_name: str, command_args: typing.List):
     dbus = ravel.session_bus()
     dbus.attach_asyncio()
+
+    ServerProxy = await dbus.get_proxy_interface_async(
+        destination=PYCONNECT_SERVER_DBUS_NAME, path='/',
+        interface=PYCONNECT_SERVER_IFACE_NAME)
+
+    server = ServerProxy(
+        connection=dbus.connection, dest=PYCONNECT_SERVER_DBUS_NAME)
+    print('aaa', await server['/'].is_connected_and_paired,
+          await server['/'].first_connected_and_paired)
 
     server_status = await fetch_server_status(dbus)
     if not server_status['connected'] and command_name in ['upload']:
