@@ -718,9 +718,16 @@ async def download_file_task(pack: KDEConnectPacket, dev_config: DeviceConfig):
     log.info(f'Download connection closed with {dev_config.last_ip}.')
 
 
-async def upload_file_task(
+ProgresCallback = typing.Callable[[
+    str,  # file name
+    int,  # sent size
+    int],  # file size
+    None]
+
+
+async def upload_file(
         dev_config: DeviceConfig, file_path: str, number_of_files: int = 1,
-        total_files_size: int = -1):
+        total_files_size: int = -1, progress_cb: ProgresCallback = None):
     """
     Upload file task.
     """
@@ -740,6 +747,9 @@ async def upload_file_task(
                 anyio.abc.SocketAttribute.remote_address)
             log.info(
                 f'Upload file {file_name} - device connected ({remote_ip}).')
+            if progress_cb:
+                progress_cb(file_name, 0, file_size)
+
             with open(file_path, 'rb') as f:
                 sent = 0
                 while sent < file_size:
@@ -747,10 +757,16 @@ async def upload_file_task(
                     await sock_client.send(data)
 
                     sent += len(data)
-                    print((
-                        f'\r* Upload file {file_name} - sent {sent} of '
-                        f'{file_size} (+{len(data)})'), end='')
-        print('')
+
+                    if progress_cb:
+                        progress_cb(file_name, sent, file_size)
+                    else:
+                        print((
+                            f'\r* Upload file {file_name} - sent {sent} of '
+                            f'{file_size} (+{len(data)})'), end='')
+
+        if not progress_cb:
+            print('')
 
         await server.aclose()
         close_server_event.set()
@@ -865,17 +881,19 @@ async def read_cert_common_name(cert_file: str) -> str:
 
 
 @ravel.interface(ravel.INTERFACE.SERVER, name=PYCONNECT_SERVER_IFACE_NAME)
-class DBUSCallbackServer:
-    def __init__(self):
-        pass
+class PYConnectCallbackServer:
+    def __init__(self, dbus):
+        self.dbus = dbus
 
     @ravel.propgetter(
         name='is_connected_and_paired',
         type=dbussy.BasicType(dbussy.TYPE.BOOLEAN),
-        # path_keyword="object_path", object_path
         change_notification=dbussy.Introspection.PROP_CHANGE_NOTIFICATION.CONST,  # noqa
     )
     async def get_is_connected_and_paired(self):
+        """
+        Checks if any device is connected now.
+        """
         for dev_config in DeviceConfig._cache.values():
             if dev_config.paired:
                 return True
@@ -884,21 +902,26 @@ class DBUSCallbackServer:
     @ravel.propgetter(
         name='first_connected_and_paired',
         type=dbussy.BasicType(dbussy.TYPE.STRING),
-        # path_keyword="object_path", object_path
         change_notification=dbussy.Introspection.PROP_CHANGE_NOTIFICATION.CONST,  # noqa
     )
     async def get_first_connected_and_paired(self):
+        """
+        Returns ID of first connected and paired device.
+        """
         for dev_config in DeviceConfig._cache.values():
-            if dev_config.paired:
+            if dev_config.connected and dev_config.paired:
                 return dev_config.device_id
         return ''
 
     @ravel.method(
         name='status',
         in_signature='',
-        out_signature='s',
+        out_signature=dbussy.BasicType(dbussy.TYPE.STRING),
       )
     async def handle_status(self):
+        """
+        Request for server and connections status.
+        """
         status = {
             'running': True,
             'connected': False,
@@ -922,21 +945,37 @@ class DBUSCallbackServer:
 
     @ravel.method(
         name='upload_file',
-        in_signature='sas',
+        in_signature=[dbussy.BasicType(dbussy.TYPE.STRING),
+                      dbussy.ArrayType(dbussy.BasicType(dbussy.TYPE.STRING))],
         arg_keys=('device_id', 'file_paths',),
-        out_signature='b',
+        out_signature=dbussy.BasicType(dbussy.TYPE.BOOLEAN),
       )
     async def handle_upload_file(self, device_id, file_paths):
-        log.info(f'handle_upload_file(): DBUS call {file_paths=}')
+        """
+        Upload file.
+        """
+        log.debug(f'handle_upload_file() DBUS call  {file_paths=}')
 
         dev_config = DeviceConfig.load(device_id)
         total_files_size = sum([os.path.getsize(f) for f in file_paths])
 
+        def progress_cb(file_name, sent, file_size):
+            self.dbus.send_signal(
+                path='/', interface=PYCONNECT_SERVER_IFACE_NAME,
+                name='upload_progress', args=(file_name, sent, file_size))
+
         for file_path in file_paths:
-            await upload_file_task(dev_config, file_path, len(file_paths),
-                                   total_files_size)
+            await upload_file(dev_config, file_path, len(file_paths),
+                              total_files_size, progress_cb)
 
         return [True]
+
+    upload_progress = ravel.def_signal_stub(
+        name='upload_progress',
+        in_signature=[dbussy.BasicType(dbussy.TYPE.STRING),
+                      dbussy.BasicType(dbussy.TYPE.UINT32),
+                      dbussy.BasicType(dbussy.TYPE.UINT32)],
+    )
 
 
 async def server_main_task():
@@ -968,7 +1007,7 @@ async def server_main_task():
     dbus.attach_asyncio()
     dbus.request_name(bus_name=PYCONNECT_SERVER_DBUS_NAME,
                       flags=DBUS.NAME_FLAG_DO_NOT_QUEUE)
-    dbus_interface = DBUSCallbackServer()
+    dbus_interface = PYConnectCallbackServer(dbus)
     dbus.register(path='/', fallback=True, interface=dbus_interface)
 
     # main task
@@ -979,6 +1018,32 @@ async def server_main_task():
         main_group.start_soon(send_my_id_packets)
 
     log.info('Server ends.')
+
+
+@ravel.interface(ravel.INTERFACE.CLIENT, name=PYCONNECT_SERVER_IFACE_NAME)
+class PyConnectClientListener:
+    """
+    Client-side interface which defines only signal listeners.
+    """
+    def __init__(self):
+        self.progressbar = None
+
+    @ravel.signal(
+        name='upload_progress',
+        in_signature=[dbussy.BasicType(dbussy.TYPE.STRING),
+                      dbussy.BasicType(dbussy.TYPE.UINT32),
+                      dbussy.BasicType(dbussy.TYPE.UINT32)],
+        arg_keys=('file_name', 'sent', 'file_size')
+    )
+    def upload_progress(self, file_name, sent, file_size):
+        if not self.progressbar or sent == 0:
+            self.progressbar = click.progressbar(
+                length=file_size, label=f'Uploading {file_name}')
+            self.progressbar.last_sent_value = 0
+
+        self.progressbar.update(sent - self.progressbar.last_sent_value)
+        if sent >= file_size:
+            print()
 
 
 async def fetch_server_status(dbus):
@@ -1083,22 +1148,37 @@ async def handle_upload_command(
 async def client_main_task(command_name: str, command_args: typing.List):
     dbus = ravel.session_bus()
     dbus.attach_asyncio()
+    dbus.register(path='/', fallback=True, interface=PyConnectClientListener)
 
-    ServerProxy = await dbus.get_proxy_interface_async(
-        destination=PYCONNECT_SERVER_DBUS_NAME, path='/',
-        interface=PYCONNECT_SERVER_IFACE_NAME)
+    # server proxy
+    try:
+        ServerProxy = await dbus.get_proxy_interface_async(
+            destination=PYCONNECT_SERVER_DBUS_NAME, path='/',
+            interface=PYCONNECT_SERVER_IFACE_NAME)
 
-    server = ServerProxy(
-        connection=dbus.connection, dest=PYCONNECT_SERVER_DBUS_NAME)
-    print('aaa', await server['/'].is_connected_and_paired,
-          await server['/'].first_connected_and_paired)
+        server_prox = ServerProxy(
+            connection=dbus.connection, dest=PYCONNECT_SERVER_DBUS_NAME)
+        server = server_prox['/']
+    except dbussy.DBusError as e:
+        pass
+        if e.name == 'org.freedesktop.DBus.Error.ServiceUnknown':
+            print(click.style('You must run "pyconnect.py server" first.',
+                              fg='red'))
+        else:
+            log.exception(
+                'Error occurred while connecting to the pyconnect server.')
+        return
 
+    # check command conditions
     server_status = await fetch_server_status(dbus)
-    if not server_status['connected'] and command_name in ['upload']:
+
+    requiring_conn = ['upload']
+    if not await server.is_connected_and_paired and command_name in requiring_conn:  # noqa
         print(click.style(
             '❌ Command unavailable without any device connected.', fg='red'))
         return
 
+    # run command
     async with anyio.create_task_group() as main_group:
         main_group.start_soon(signal_handler, main_group.cancel_scope)
 
