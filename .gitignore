@@ -134,3 +134,4 @@ dmypy.json
 pyconnect.config.json
 1*.py
 *.jpg
+gnome-shell-extension-gsconnect/

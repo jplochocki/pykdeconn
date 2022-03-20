@@ -85,24 +85,26 @@ log = logging.getLogger('pyconnect.detailed_log')
 
 PYCONNECT_SERVER_DBUS_NAME = 'io.github.jplochocki.pyconnect'
 PYCONNECT_SERVER_IFACE_NAME = 'io.github.jplochocki.pyconnect'
-# SERVER_DBUS_PATH = '/'
-DBUS_IFACE_CLIENT = 'io.github.jplochocki.pyconnect.client'
-DBUS_CLIENT_PATH = '/'
 
 
 KDE_CONNECT_DEFAULT_PORT = 1716
 KDE_CONNECT_TRANSFER_MIN = 1739
 KDE_CONNECT_TRANSFER_MAX = 1764
 KDE_CONNECT_PROTOCOL_VERSION = 7
+SMS_MESSAGE_PACKET_VERSION = 2
 
 PYCONNECT_DEVICE_ID = None
 PYCONNECT_DEVICE_NAME = None
 
 PYCONNECT_INCOMING_CAPABILITIES = [
     'kdeconnect.share.request',
+    'kdeconnect.sms.messages',
 ]
 PYCONNECT_OUTGOING_CAPABILITIES = [
     'kdeconnect.share.request',
+    'kdeconnect.sms.request',
+    'kdeconnect.sms.request_conversation',
+    'kdeconnect.sms.request_conversations',
 ]
 
 PYCONNECT_CERTFILE = None
@@ -454,7 +456,7 @@ async def wait_for_incoming_id(main_group: anyio.abc.TaskGroup):
 async def outgoing_connection_task(
     id_packet: KDEConnectPacket,
     remote_ip: str,
-    main_group: anyio.abc.TaskGroup
+    main_group: anyio.abc.TaskGroup,
 ):
     """
     Outgoing conection to the known device.
@@ -904,6 +906,34 @@ async def upload_file(
     log.debug('Transfer server closed.')
 
 
+async def send_sms(
+    dev_config: DeviceConfig,
+    addresses: typing.List[str],
+    message_body: str,
+    sim_card_id: int = -1,
+):
+    """
+    Sends text message.
+    """
+    addr = [{'address': a} for a in addresses]
+    pack = {
+        'id': 0,
+        'type': 'kdeconnect.sms.request',
+        'body': {
+            'version': SMS_MESSAGE_PACKET_VERSION,
+            'sendSms': True,
+            'addresses': addr,
+            'messageBody': message_body,
+        },
+    }
+
+    if sim_card_id != -1:
+        pack['body']['sub_id'] = sim_card_id
+
+    await dev_config.connection_ssock.send(prepare_to_send(pack))
+    log.debug(f'SMS message packet sent: {pack!r}.')
+
+
 async def signal_handler(scope: anyio.CancelScope):
     with anyio.open_signal_receiver(signal.SIGINT, signal.SIGTERM) as signals:
         async for signum in signals:
@@ -1101,6 +1131,42 @@ class PYConnectCallbackServer:
 
         return [True]
 
+    @ravel.method(
+        name='send_sms',
+        in_signature=[
+            dbussy.BasicType(dbussy.TYPE.STRING),
+            dbussy.ArrayType(dbussy.BasicType(dbussy.TYPE.STRING)),
+            dbussy.BasicType(dbussy.TYPE.STRING),
+            dbussy.BasicType(dbussy.TYPE.INT32),
+        ],
+        arg_keys=(
+            'device_id',
+            'addresses',
+            'message_body',
+            'sim_card_id',
+        ),
+        out_signature=dbussy.BasicType(dbussy.TYPE.BOOLEAN),
+    )
+    async def send_sms(self, device_id, addresses, message_body, sim_card_id):
+        """
+        Sends SMS message.
+        """
+        if not DeviceConfig.is_connected_device(device_id):
+            raise ravel.ErrorReturn(
+                DBUS.ERROR_DISCONNECTED, 'Device not connected (or not known).'
+            )
+        dev_config = DeviceConfig.load(device_id)
+
+        try:
+            await send_sms(dev_config, addresses, message_body, sim_card_id)
+        except Exception as e:
+            log.exception('Exception occurred while sending SMS message.')
+            raise ravel.ErrorReturn(
+                DBUS.ERROR_FAILED,
+                f'Exception occurred while sending SMS message {e!r}.',
+            )
+        return [True]
+
     upload_progress = ravel.def_signal_stub(
         name='upload_progress',
         in_signature=[
@@ -1244,6 +1310,7 @@ def human_readable_timedelta(td: datetime.timedelta):
 
 async def handle_status_command(
     server_status: typing.Dict,
+    server_proxy,
     scope: anyio.CancelScope,
     dbus: ravel.Connection,
 ):
@@ -1286,7 +1353,8 @@ async def handle_status_command(
 
 async def handle_upload_command(
     server_status: typing.Dict,
-    filenames: typing.List,
+    server_proxy,
+    filenames: typing.List[str],
     scope: anyio.CancelScope,
     dbus: ravel.Connection,
 ):
@@ -1313,6 +1381,30 @@ async def handle_upload_command(
     scope.cancel()
 
 
+async def handle_send_sms_command(
+    server_status: typing.Dict,
+    server_proxy,
+    addresses: typing.List[str],
+    message_body: str,
+    sim_card_id: int,
+    scope: anyio.CancelScope,
+    dbus: ravel.Connection,
+):
+    """
+    Sends SMS message.
+    """
+    try:
+        await server_proxy.send_sms(
+            server_status['devices'][0]['device_id'],
+            addresses,
+            message_body,
+            sim_card_id,
+        )
+    except dbussy.DBusError as e:
+        log.exception(f'Error while sending SMS message: {e!r}')
+    scope.cancel()
+
+
 async def client_main_task(command_name: str, command_args: typing.List):
     dbus = ravel.session_bus()
     dbus.attach_asyncio()
@@ -1326,10 +1418,10 @@ async def client_main_task(command_name: str, command_args: typing.List):
             interface=PYCONNECT_SERVER_IFACE_NAME,
         )
 
-        server_prox = ServerProxy(
+        server_proxy_obj = ServerProxy(
             connection=dbus.connection, dest=PYCONNECT_SERVER_DBUS_NAME
         )
-        server = server_prox['/']
+        server_proxy = server_proxy_obj['/']
     except dbussy.DBusError as e:
         pass
         if e.name == 'org.freedesktop.DBus.Error.ServiceUnknown':
@@ -1347,11 +1439,11 @@ async def client_main_task(command_name: str, command_args: typing.List):
     # check command conditions
     server_status = await fetch_server_status(dbus)
 
-    requiring_conn = ['upload']
+    requiring_conn = ['upload', 'sendsms']
     if (
-        not await server.is_connected_and_paired
+        not await server_proxy.is_connected_and_paired
         and command_name in requiring_conn
-    ):  # noqa
+    ):
         print(
             click.style(
                 '❌ Command unavailable without any device connected.', fg='red'
@@ -1367,8 +1459,10 @@ async def client_main_task(command_name: str, command_args: typing.List):
             {
                 'status': handle_status_command,
                 'upload': handle_upload_command,
+                'sendsms': handle_send_sms_command,
             }.get(command_name),
             server_status,
+            server_proxy,
             *command_args,
             main_group.cancel_scope,
             dbus,
@@ -1391,6 +1485,24 @@ def status():
 )
 def upload(filenames):
     anyio.run(client_main_task, 'upload', [filenames])
+
+
+@main.command()
+@click.option(
+    '-s',
+    '--sim',
+    'sim_card_id',
+    default=-1,
+    required=False,
+    type=click.INT,
+    help='Selects sim card',
+)
+@click.argument('addresses', type=click.STRING, nargs=-1, required=True)
+@click.argument('message_body', type=click.STRING, nargs=1, required=True)
+def sendsms(sim_card_id, addresses, message_body):
+    anyio.run(
+        client_main_task, 'sendsms', [addresses, message_body, sim_card_id]
+    )
 
 
 @main.command()
