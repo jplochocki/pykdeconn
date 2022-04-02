@@ -1,0 +1,2 @@
+[run]
+omit = 1*.py tests/*

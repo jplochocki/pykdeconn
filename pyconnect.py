@@ -201,6 +201,8 @@ class DeviceConfig:
     last_connection_date: datetime.datetime = field(
         default_factory=lambda: datetime.datetime.now()
     )
+    incoming_capabilities: typing.List[str] = field(default_factory=lambda: [])
+    outgoing_capabilities: typing.List[str] = field(default_factory=lambda: [])
 
     _cache: typing.ClassVar = {}
 
@@ -233,16 +235,15 @@ class DeviceConfig:
         """
         Checks in configuration whether the device ID is known.
         """
-        return 'devices' in config and device_id in config['devices']
+        return bool(config.get('devices', {}).get('device_id', False))
 
     @staticmethod
     def is_connected_device(device_id: str) -> bool:
         """
         Checks by ID whether the device is connected.
         """
-        if device_id not in DeviceConfig._cache:
-            return False
-        return DeviceConfig._cache[device_id].connected
+        d = DeviceConfig._cache.get(device_id, False)
+        return d.connected if d else False
 
     @staticmethod
     def is_paired_device(device_id: str) -> bool:
@@ -251,7 +252,7 @@ class DeviceConfig:
         """
         return (
             config.get('devices', {}).get(device_id, {}).get('paired', False)
-        )  # noqa
+        )
 
     @classmethod
     def load_from_id_pack(cls, pack: KDEConnectPacket):
@@ -280,6 +281,8 @@ class DeviceConfig:
                 device_id=pack_body['deviceId'],
                 device_name=pack_body['deviceName'],
             )
+        dev.incoming_capabilities = pack_body['incomingCapabilities'].copy()
+        dev.outgoing_capabilities = pack_body['outgoingCapabilities'].copy()
 
         dev.save()
         return dev
@@ -474,7 +477,6 @@ async def outgoing_connection_task(
                 f'({dev_config.device_name}).'
             )
         )
-        dev_config.connected = True
         could_send_my_id_packs = False
 
         # send identity
@@ -482,13 +484,29 @@ async def outgoing_connection_task(
         log.debug('Identity packet sent to {remote_ip}:{remote_port}.')
 
         # wrap TLS
-        ssock = await TLSStream.wrap(
-            sock,
-            server_side=True,
-            ssl_context=dev_config.ssl_context(ssl.Purpose.CLIENT_AUTH),
-            standard_compatible=False,
-        )
+        try:
+            ssock = await TLSStream.wrap(
+                sock,
+                server_side=True,
+                ssl_context=dev_config.ssl_context(ssl.Purpose.CLIENT_AUTH),
+                standard_compatible=False,
+            )
+        except ssl.SSLCertVerificationError:
+            log.exception(
+                (
+                    f'Cert verify failed with {remote_ip}:{remote_port}'
+                    f' = treat us as unpaired.'
+                )
+            )
+            dev_config.connected = False
+            dev_config.paired = False
+            dev_config.certificate_PEM = ''
+            dev_config.save()
+            return
+
+        dev_config.last_ip = remote_ip
         dev_config.connection_ssock = ssock
+        dev_config.connected = True
         log.debug(f'Wrapped TLS connection with {remote_ip}:{remote_port}.')
 
         # handle pair if needed
@@ -555,19 +573,35 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
 
             # load device config
             dev_config = DeviceConfig.load_from_id_pack(pack)
-            dev_config.last_ip = remote_ip
-            dev_config.connected = True
-            dev_config.save()
+            try:
+                ssock = await TLSStream.wrap(
+                    client,
+                    server_side=False,
+                    ssl_context=dev_config.ssl_context(
+                        ssl.Purpose.SERVER_AUTH
+                    ),
+                    hostname=remote_ip,
+                    standard_compatible=False,
+                )
+            except ssl.SSLCertVerificationError:
+                log.exception(
+                    (
+                        f'Cert verify failed with {remote_ip}:'
+                        f'{remote_port} = treat us as unpaired.'
+                    )
+                )
+                dev_config.connected = False
+                dev_config.paired = False
+                dev_config.certificate_PEM = ''
+                dev_config.save()
+                return
 
-            ssock = await TLSStream.wrap(
-                client,
-                server_side=False,
-                ssl_context=dev_config.ssl_context(ssl.Purpose.SERVER_AUTH),
-                hostname=remote_ip,
-                standard_compatible=False,
-            )
+            dev_config.last_ip = remote_ip
             dev_config.connection_ssock = ssock
-            log.debug('TLS connection wrapped.')
+            dev_config.connected = True
+            log.debug(
+                f'Wrapped TLS connection with {remote_ip}:{remote_port}.'
+            )
 
             # try to obtain a device cert
             try:
@@ -699,6 +733,12 @@ async def handle_pairing(
                         f' {pack["type"]}).\n{pack!r}'
                     )
                 )
+                pair_pack['body']['pair'] = False
+                await dev_config.connection_ssock.send(
+                    prepare_to_send(pair_pack)
+                )
+                dev_config.paired = False
+                dev_config.save()
                 return False
 
             if not pack['body']['pair']:

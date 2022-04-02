@@ -129,9 +129,10 @@ dmypy.json
 .pyre/
 
 
-001.txt
+00*.txt
 *.pem
 pyconnect.config.json
 1*.py
+1*.js
 *.jpg
 gnome-shell-extension-gsconnect/
