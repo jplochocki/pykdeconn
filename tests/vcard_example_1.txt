@@ -1,0 +1,23 @@
+BEGIN:VCARD
+VERSION:2.1
+N:Albert;Yannick;;
+FN:Yannick Albert
+ORG:ARTsinn
+TITLE:CEO
+TEL;CELL;VOICE:+49 1525 1333833
+ADR;WORK:;;Fockstr. 31;Kiel;SH;24114;Deutschland
+LABEL;WORK;ENCODING=QUOTED-PRINTABLE:ARTsinn=0D=0A=
+ Yannick Albert=0D=0A=
+ Fockstr. 31=0D=0A=
+ 24114 Kiel, SH, Deutschland
+ADR;HOME:;Fockstr. 31;;Kiel;SH;24114;Deutschland
+LABEL;HOME;ENCODING=QUOTED-PRINTABLE: Yannick Albert=0D=0A=
+ Fockstr. 31=0D=0A=
+ 24114 Kiel, SH, Deutschland
+X-WAB-GENDER:2
+URL;HOME:http://yckart.com/
+URL;WORK:http://artsinn.de/
+BDAY:19911008
+EMAIL;PREF;INTERNET:info@artsinn.de
+REV:20130619T014947Z
+END:VCARD

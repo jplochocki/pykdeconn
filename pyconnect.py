@@ -15,11 +15,13 @@ from dataclasses import dataclass, field, asdict  # noqa
 import datetime
 import uuid
 import subprocess
+from weakref import ref as weak_ref
 
 import anyio
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSStream, TLSListener
 from anyio.streams.buffered import BufferedByteReceiveStream
+from anyio.streams.memory import MemoryObjectSendStream
 
 import ravel
 import dbussy
@@ -99,12 +101,16 @@ PYCONNECT_DEVICE_NAME = None
 PYCONNECT_INCOMING_CAPABILITIES = [
     'kdeconnect.share.request',
     'kdeconnect.sms.messages',
+    'kdeconnect.contacts.response_uids_timestamps',
+    'kdeconnect.contacts.response_vcards',
 ]
 PYCONNECT_OUTGOING_CAPABILITIES = [
     'kdeconnect.share.request',
     'kdeconnect.sms.request',
     'kdeconnect.sms.request_conversation',
     'kdeconnect.sms.request_conversations',
+    'kdeconnect.contacts.request_all_uids_timestamps',
+    'kdeconnect.contacts.request_vcards_by_uid',
 ]
 
 PYCONNECT_CERTFILE = None
@@ -210,6 +216,7 @@ class DeviceConfig:
         self._ssl_cnx_cache = {}
         self._connected = False
         self.connection_ssock = None
+        self.packs_observers = []
 
         DeviceConfig._cache[self.device_id] = self
 
@@ -230,12 +237,26 @@ class DeviceConfig:
             if self.device_id in DeviceConfig._cache:
                 del DeviceConfig._cache[self.device_id]
 
+    def add_pack_observer(
+        self,
+        pack: str,
+        send_pack_to: MemoryObjectSendStream,
+        once: bool = False,
+    ):
+        self.packs_observers.append(
+            {
+                'type': pack,
+                'send_pack_to': weak_ref(send_pack_to),
+                'once': once,
+            }
+        )
+
     @staticmethod
     def is_known_device(device_id: str) -> bool:
         """
         Checks in configuration whether the device ID is known.
         """
-        return bool(config.get('devices', {}).get('device_id', False))
+        return bool(config.get('devices', {}).get(device_id, False))
 
     @staticmethod
     def is_connected_device(device_id: str) -> bool:
@@ -518,6 +539,8 @@ async def outgoing_connection_task(
                 return
 
         # receiving packets
+        main_group.start_soon(receive_contacts, dev_config)
+
         while True:
             pack = await receive_packet(bssock)
             if not pack:
@@ -626,6 +649,7 @@ async def incoming_connection_task(main_group: anyio.abc.TaskGroup):
                     return
 
             # receive packets
+            main_group.start_soon(receive_contacts, dev_config)
             while True:
                 pack = await receive_packet(bssock)
                 if not pack:
@@ -700,6 +724,21 @@ async def handle_packet(
     # incoming file
     if pack['type'] == 'kdeconnect.share.request':
         main_group.start_soon(download_file_task, pack, dev_config)
+
+    # pakage observers
+    dev_config.packs_observers = [
+        pk for pk in dev_config.packs_observers if pk['send_pack_to']()
+    ]
+    observers = filter(
+        lambda pk: pk['type'] == pack['type'], dev_config.packs_observers
+    )
+    for ob in observers:
+        async with ob['send_pack_to']():
+            await ob['send_pack_to']().send(pack)
+        if ob['once']:
+            dev_config.packs_observers = [
+                pk for pk in dev_config.packs_observers if pk != ob
+            ]
 
     return True
 
@@ -972,6 +1011,114 @@ async def send_sms(
 
     await dev_config.connection_ssock.send(prepare_to_send(pack))
     log.debug(f'SMS message packet sent: {pack!r}.')
+
+
+def parse_VCard21(data):
+    """
+    Simple VCard parser (2.1 version only).
+
+
+    Rewritten http://jsfiddle.net/ARTsinn/P2t2P/ (and `GSConnect`) code.
+    """
+
+    def _decode_quoted_printable(data):
+        # https://tools.ietf.org/html/rfc2045#section-6.7, rule 3
+        data = re.sub(r'[\t\x20]$', '', data, 0, re.M)
+
+        # Remove hard line breaks preceded by `=`
+        data = re.sub(r'=(?:\r\n?|\n|$)', '', data)
+
+        # https://tools.ietf.org/html/rfc2045#section-6.7, note 1
+        def _replace_char(a):
+            return int(a.group(1), 16).to_bytes(1, byteorder='little')
+
+        return re.sub(
+            rb'=([a-fA-F0-9]{2})', _replace_char, data.encode('utf-8')
+        ).decode('utf-8')
+
+    vcard = {'fn': 'Unknown Contact', 'tel': []}
+
+    for ln in re.sub(r'\r\n |\r |\n |=\n', '', data).splitlines():
+        # empty or not interesting line
+        if not ln or not re.match(r'^fn|tel|photo|x-kdeconnect', ln, re.I):
+            continue
+
+        # basic fields (fn, x-kdeconnect-timestamp, etc)
+        a = re.match(r'^([^:;]+):(.+)$', ln)
+        if a:
+            key, value = a.groups()
+            vcard[key.lower()] = value
+            continue
+
+        # typed fields (tel, adr, etc)
+        a = re.match(r'^([^:;]+);([^:]+):(.+)$', ln)
+        if a:
+            key, type_, value = a.groups()
+            key = re.sub(r'item\d{1,2}\.', '', key).lower()
+            value = value.split(';')
+
+            # type(s)
+            meta = {}
+            for i, tp in enumerate(type_.split(';')):
+                a = re.match(r'([a-z]+)=(.*)', tp, re.I)
+                if a:
+                    meta[a.group(1)] = a.group(2)
+                else:
+                    meta[f'type{"" if i == 0 else i}'] = tp.lower()
+
+            # value(s)
+            if key not in vcard:
+                vcard[key] = []
+
+            # decode QUOTABLE-PRINTABLE
+            if meta.get('ENCODING', '') == 'QUOTED-PRINTABLE':
+                del meta['ENCODING']
+                value = [_decode_quoted_printable(v) for v in value]
+
+            # decode UTF-8
+            if meta.get('CHARSET', '') == 'UTF-8':
+                del meta['CHARSET']
+
+            # special case for FN (full name)
+            if key == 'fn':
+                vcard[key] = value[0]
+            else:
+                vcard[key].append({'meta': meta, 'value': value})
+    return vcard
+
+
+async def receive_contacts(dev_config):
+    await anyio.sleep(3)
+
+    if (
+        'kdeconnect.contacts.request_all_uids_timestamps'
+        not in dev_config.incoming_capabilities
+        or 'kdeconnect.contacts.request_vcards_by_uid'
+        not in dev_config.incoming_capabilities
+    ):
+        log.error('No capabilities to do this operation.')
+        return
+
+    # send request for uids
+    pack = {
+        'id': 0,
+        'type': 'kdeconnect.contacts.request_all_uids_timestamps',
+        'body': {},
+    }
+
+    sender, receiver = anyio.create_memory_object_stream()
+    dev_config.add_pack_observer(
+        'kdeconnect.contacts.response_uids_timestamps', sender, True
+    )
+
+    await dev_config.connection_ssock.send(prepare_to_send(pack))
+    log.debug(f'Request for uids sent\n{pack!r}')
+
+    async with anyio.fail_after(30):
+        async with receiver:
+            pack = await receiver.receive()
+
+    # TODO
 
 
 async def signal_handler(scope: anyio.CancelScope):
