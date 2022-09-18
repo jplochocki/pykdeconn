@@ -723,11 +723,12 @@ async def handle_packet(
 
     # incoming file
     if pack['type'] == 'kdeconnect.share.request':
-        if not pack['body']['url']:
-            main_group.start_soon(download_file_task, pack, dev_config)
-        else:
-            log.info(f'Openining url: {pack["body"]["url"]}')
+        try:
             webbrowser.open_new_tab(pack['body']['url'])
+            log.info(f'Openining url: {pack["body"]["url"]}')
+        except KeyError:
+            main_group.start_soon(download_file_task, pack, dev_config)
+
 
     # pakage observers
     dev_config.packs_observers = [
