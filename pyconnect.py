@@ -16,7 +16,7 @@ import datetime
 import uuid
 import subprocess
 from weakref import ref as weak_ref
-
+import webbrowser
 import anyio
 from anyio.abc import SocketStream
 from anyio.streams.tls import TLSStream, TLSListener
@@ -723,7 +723,11 @@ async def handle_packet(
 
     # incoming file
     if pack['type'] == 'kdeconnect.share.request':
-        main_group.start_soon(download_file_task, pack, dev_config)
+        if not pack['body']['url']:
+            main_group.start_soon(download_file_task, pack, dev_config)
+        else:
+            log.info(f'Openining url: {pack["body"]["url"]}')
+            webbrowser.open_new_tab(pack['body']['url'])
 
     # pakage observers
     dev_config.packs_observers = [
@@ -1011,6 +1015,26 @@ async def send_sms(
 
     await dev_config.connection_ssock.send(prepare_to_send(pack))
     log.debug(f'SMS message packet sent: {pack!r}.')
+
+async def share_url(
+    dev_config: DeviceConfig,
+    url: str,
+):
+    """
+   Shares url.
+    """
+    print("url",url)
+    
+    pack = {
+        'id': 0,
+        'type': 'kdeconnect.share.request',
+        'body': {
+            'url': url,
+        }
+    }
+
+    await dev_config.connection_ssock.send(prepare_to_send(pack))
+    log.debug(f'Shared url: {pack!r}.')
 
 
 def parse_VCard21(data):
@@ -1354,6 +1378,38 @@ class PYConnectCallbackServer:
             )
         return [True]
 
+    @ravel.method(
+        name='share_url',
+        in_signature=[
+            dbussy.BasicType(dbussy.TYPE.STRING),
+            dbussy.BasicType(dbussy.TYPE.STRING),
+        ],
+        arg_keys=(
+            'device_id',
+            'url',
+        ),
+        out_signature=dbussy.BasicType(dbussy.TYPE.BOOLEAN),
+    )
+    async def shareurl(self, device_id, url):
+        """
+        Shares url.
+        """
+        if not DeviceConfig.is_connected_device(device_id):
+            raise ravel.ErrorReturn(
+                DBUS.ERROR_DISCONNECTED, 'Device not connected (or not known).'
+            )
+        dev_config = DeviceConfig.load(device_id)
+
+        try:
+            await share_url(dev_config, url)
+        except Exception as e:
+            log.exception('Exception occurred while sharing url.')
+            raise ravel.ErrorReturn(
+                DBUS.ERROR_FAILED,
+                f'Exception occurred while sharing url {e!r}.',
+            )
+        return [True]
+
     upload_progress = ravel.def_signal_stub(
         name='upload_progress',
         in_signature=[
@@ -1567,6 +1623,25 @@ async def handle_upload_command(
         )
     scope.cancel()
 
+async def handle_share_url_command(
+    server_status: typing.Dict,
+    server_proxy,
+    url: str,
+    scope: anyio.CancelScope,
+    dbus: ravel.Connection,
+):
+    """
+    Shares an url with device..
+    """
+    try:
+        await server_proxy.share_url(
+            server_status['devices'][0]['device_id'],
+            url,
+        )
+    except dbussy.DBusError as e:
+        log.exception(f'Error while sharing url: {e!r}')
+    scope.cancel()
+
 
 async def handle_send_sms_command(
     server_status: typing.Dict,
@@ -1626,7 +1701,7 @@ async def client_main_task(command_name: str, command_args: typing.List):
     # check command conditions
     server_status = await fetch_server_status(dbus)
 
-    requiring_conn = ['upload', 'sendsms']
+    requiring_conn = ['upload', 'sendsms', 'shareurl']
     if (
         not await server_proxy.is_connected_and_paired
         and command_name in requiring_conn
@@ -1647,6 +1722,7 @@ async def client_main_task(command_name: str, command_args: typing.List):
                 'status': handle_status_command,
                 'upload': handle_upload_command,
                 'sendsms': handle_send_sms_command,
+                'shareurl': handle_share_url_command
             }.get(command_name),
             server_status,
             server_proxy,
@@ -1673,7 +1749,13 @@ def status():
 def upload(filenames):
     anyio.run(client_main_task, 'upload', [filenames])
 
-
+@main.command()
+@click.argument(
+    'url', type=click.STRING, required=True
+)
+def shareurl(url):
+    anyio.run(client_main_task, 'shareurl', [url])
+    
 @main.command()
 @click.option(
     '-s',
