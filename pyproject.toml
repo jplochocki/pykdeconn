@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyconnect"
+version = "1.0"
+description = "Simple KDE Connect client protocol implementation in Python"
+readme = {file = "README.md", content-type = "text/markdown"}
+authors = [
+    {name = "Jacek Płochocki", email = "jplochocki@op.pl"},
+]
+license = {text = "MIT"}
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.9",
+    "Operating System :: OS Independent",
+]
+dependencies = [
+    "pydantic >= 1.10",
+    "anyio >= 3.6",
+    "click >= 8.0",
+    "DBussy >= 1.3",
+]
+requires-python = ">=3.9"
+
+# BETA-feature "Automatic discovery"
+# Leaving out any information about the package structure to enable automatic discovery. src-layout works out of the box
+# https://setuptools.pypa.io/en/latest/userguide/package_discovery.html#automatic-discovery
+
+[project.urls]
+homepage = "https://jplochocki.github.io/"
+documentation = "https://github.com/jplochocki/pyconnect"
+repository = "https://github.com/jplochocki/pyconnect"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "twine>=4.0.2",
+    "build",
+]
+
+[project.scripts]
+pyconnect = "pyconnect:client_main"
+pyconnect-server = "pyconnect:server_main"

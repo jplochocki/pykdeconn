@@ -136,3 +136,4 @@ pyconnect.config.json
 1*.js
 *.jpg
 gnome-shell-extension-gsconnect/
+temp/

@@ -1,3 +1,0 @@
-anyio>=3.5
-click>=8.0
-DBussy>=1.3
