@@ -1,4 +1,6 @@
 import logging
+import sys
+from pathlib import Path
 
 
 class CustomConsoleFormatter(logging.Formatter):
@@ -25,3 +27,13 @@ class CustomConsoleFormatter(logging.Formatter):
         log_fmt = self.FORMATS.get(record.levelno)
         formatter = logging.Formatter(log_fmt)
         return formatter.format(record)
+
+
+def runnin_in_pytest() -> bool:
+    """
+    Checking if we're running in pytest.
+    """
+    p = Path(sys.argv[0])
+    return p.name in ['pytest', 'py.test'] or p.match(
+        '*/site-packages/pytest/__main__.py'
+    )
