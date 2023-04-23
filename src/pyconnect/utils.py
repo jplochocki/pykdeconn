@@ -1,6 +1,9 @@
 import logging
 import sys
 from pathlib import Path
+from typing import Dict, Any
+import re
+import json
 
 
 class CustomConsoleFormatter(logging.Formatter):
@@ -29,7 +32,7 @@ class CustomConsoleFormatter(logging.Formatter):
         return formatter.format(record)
 
 
-def runnin_in_pytest() -> bool:
+def running_in_pytest() -> bool:
     """
     Checking if we're running in pytest.
     """
@@ -37,3 +40,43 @@ def runnin_in_pytest() -> bool:
     return p.name in ['pytest', 'py.test'] or p.match(
         '*/site-packages/pytest/__main__.py'
     )
+
+
+def simple_toml_parser(txt: str) -> Dict[str, Any]:
+    """
+    Simple TOML (like) parser. dconf returns TOML-like string
+    """
+    res = {}
+    last_section = None
+    for ln in txt.splitlines():
+        # sections
+        if m := (re.match(r'^\s*\[\s*(.+)\s*\]\s*$', ln)):
+            last_section = m.group(1)
+            res[last_section] = {}
+
+        # values
+        elif m := (re.match(r'^\s*(?P<name>.+)\s*=\s*(?P<value>.+)$', ln)):
+            name = m.group('name')
+            value = m.group('value')
+
+            # bool
+            if m := (re.match(r'^\s*(true|false)\s*$', value, re.I)):
+                res[last_section][name] = bool(
+                    re.match('true', m.group(1), re.I)
+                )
+
+            # string
+            elif m := (re.match(r'^\s*(\'|")(.+?)(\1)\s*$', value)):
+                res[last_section][name] = m.group(2)
+
+            # list of strings
+            elif m := (re.match(r'^\s*(\[\s*.*?\s*\])\s*$', value)):
+                res[last_section][name] = json.loads(
+                    re.sub(r'(?<!\\)\'', '"', m.group(1)))
+
+            # uint32
+            elif m := (re.match(r'^\s*uint32\s+(\d+)\s*$', value, re.I)):
+                res[last_section][name] = int(m.group(1))
+
+            # just ignore anything you don't know
+    return res

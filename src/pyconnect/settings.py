@@ -1,5 +1,5 @@
 import re
-from typing import Optional, Any, List, Dict, ClassVar
+from typing import Optional, Any, List, Tuple, Dict, Literal, ClassVar
 import datetime
 import logging
 import logging.config
@@ -20,8 +20,8 @@ from pydantic import (
 )
 
 from .protocol.packets import IdentityPacket, generate_IdentityPacket
-from .utils import runnin_in_pytest
-from .sslutils import generate_cert
+from .utils import running_in_pytest
+from .sslutils import generate_cert, read_cert_common_name
 
 
 logging.config.dictConfig(
@@ -49,6 +49,9 @@ logging.config.dictConfig(
         },
     }
 )
+
+
+log = logging.getLogger('pyconnect.server')
 
 
 class InvalidPEMFormatError(PydanticValueError):
@@ -82,7 +85,7 @@ class DeviceConfig(BaseModel):
     paired: bool = False
     last_ip: Optional[IPvAnyAddress] = None
     last_connection_date: PastDate = Field(
-        default_factory=lambda: datetime.datetime.now
+        default_factory=lambda: datetime.datetime.now()
     )
 
     incoming_capabilities: List[str] = []
@@ -102,6 +105,8 @@ class DeviceConfig(BaseModel):
             device_id=pack.body.deviceId,
             device_name=pack.body.deviceName,
         )
+        DeviceConfig._devices_cache[pack.body.deviceId] = dev
+
         dev.incoming_capabilities = pack.body.incomingCapabilities.copy()
         dev.outgoing_capabilities = pack.body.outgoingCapabilities.copy()
 
@@ -125,7 +130,7 @@ class PyConnectSettingsSourceDir(BaseSettings):
         exists or ``~/.pyconnect`` else). If we're running in pytest
         environment - return tests/config path.
         """
-        if runnin_in_pytest():
+        if running_in_pytest():
             # We are trying to determine the path to the tests/ directory.
             # Expected test calls python -m pytest -s ../tests/ and CWD was
             # venv dir
@@ -149,23 +154,59 @@ class PyConnectSettingsSourceDir(BaseSettings):
 
 
 config_source_dir = PyConnectSettingsSourceDir()
+config_file = config_source_dir.config_dir / 'config.json'
 
 
 def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
-    """ """
-    cfg_path = config_source_dir.config_dir / 'config.json'
+    """
+    Read settings from JSON file.
+    """
     encoding = settings.__config__.env_file_encoding
-    if cfg_path.exists():
-        return json.loads(cfg_path.read_text(encoding))
+    if config_file.exists():
+        return json.loads(config_file.read_text(encoding))
     else:
         return {}
 
 
 class PyConnectSettings(BaseSettings):
-    device_id: str = Field(
-        default_factory=lambda: uuid.uuid4().urn.replace('urn:uuid:', ''),
-    )
+    log_level: Literal[
+        logging.CRITICAL,
+        logging.ERROR,
+        logging.WARNING,
+        logging.INFO,
+        logging.DEBUG,
+    ] = logging.DEBUG
+
+    @validator('log_level', always=True)
+    def log_level_set(cls, v):
+        if v not in [
+            logging.CRITICAL,
+            logging.ERROR,
+            logging.WARNING,
+            logging.INFO,
+            logging.DEBUG,
+        ]:
+            raise ValueError(f'Invalid log_level value ({v}).')
+        log.setLevel(v)
+        return v
+
     device_name: str = Field(default_factory=socket.gethostname)
+    device_id: str = ''
+
+    @validator('device_id', always=True)
+    def device_id_gen_or_read(cls, v, values) -> str:
+        """
+        Reads device_id from the certificate file (if any) or generates one.
+        """
+        (
+            device_certfile,
+            _,
+        ) = PyConnectSettings.gen_cert_files_paths(values['device_name'])
+        if device_certfile.exists():
+            return read_cert_common_name(device_certfile)
+        else:
+            return uuid.uuid4().urn.replace('urn:uuid:', '')
+
     device_type: str = 'laptop'
     incoming_capabilities: List[str] = []
     outgoing_capabilities: List[str] = []
@@ -176,26 +217,23 @@ class PyConnectSettings(BaseSettings):
     @validator('device_certfile', always=True)
     def device_certfile_gen_path(cls, v, values):
         if isinstance(v, Path):
-            return v
+            return v.resolve()
         else:
-            dev_name = re.sub(
-                r'[^a-z0-9\-]', '', values['device_name'].lower()
-            )
-            return config_source_dir.config_dir / f'certificate-{dev_name}.pem'
+            return PyConnectSettings.gen_cert_files_paths(
+                values['device_name']
+            )[0]
 
     @validator('device_keyfile', always=True)
     def device_keyfile_gen_path_and_cert(cls, v, values):
         device_keyfile = v
+        device_certfile = values['device_certfile']
         if not isinstance(device_keyfile, Path):
-            dev_name = re.sub(
-                r'[^a-z0-9\-]', '', values['device_name'].lower()
-            )
-            device_keyfile = (
-                config_source_dir.config_dir / f'private-{dev_name}.pem'
-            )
+            (
+                device_certfile,
+                device_keyfile,
+            ) = PyConnectSettings.gen_cert_files_paths(values['device_name'])
 
         # create certs files if don't exists
-        device_certfile = values['device_certfile']
         if not device_keyfile.exists() or not device_certfile.exists():
             generate_cert(
                 values['device_name'],
@@ -204,7 +242,35 @@ class PyConnectSettings(BaseSettings):
                 device_keyfile,
             )
 
-        return device_keyfile
+        return device_keyfile.resolve()
+
+    @staticmethod
+    def gen_cert_files_paths(device_name) -> Tuple[Path, Path]:
+        """
+        Generates paths to a certificate files pair.
+        """
+        dev_name = re.sub(r'[^a-z0-9\-]', '', device_name.lower())
+        return (
+            config_source_dir.config_dir / f'certificate-{dev_name}.pem',
+            config_source_dir.config_dir / f'private-{dev_name}.pem',
+        )
+
+    def save(self):
+        """
+        Save settings to a JSON file.
+        """
+        encoding = self.__config__.env_file_encoding
+
+        # save cert paths as relative
+        a = self.dict()
+        a['device_certfile'] = str(
+            self.device_certfile.relative_to(config_file.parent)
+        )
+        a['device_keyfile'] = str(
+            self.device_keyfile.relative_to(config_file.parent)
+        )
+
+        config_file.write_text(json.dumps(a, indent=4), encoding=encoding)
 
     class Config:
         env_prefix = 'PYCONNECT_'
@@ -226,6 +292,8 @@ class PyConnectSettings(BaseSettings):
 
 
 config = PyConnectSettings()
+if not config_file.exists():
+    config.save()
 
 
 def generate_my_identity() -> IdentityPacket:

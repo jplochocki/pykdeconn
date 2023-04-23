@@ -40,7 +40,7 @@ def generate_cert(
             '-days',
             '3650',
             '-subj',
-            f'/O=jplochocki.github.io/OU=PYConnect/CN={device_id}',
+            f'/O=jplochocki.github.io/OU=PyConnect/CN={device_id}',
         ],
         stderr=subprocess.STDOUT,
         check=False,
@@ -71,7 +71,8 @@ def read_cert_common_name(cert_file: Path) -> str:
             '-subject',
             '-inform',
             'pem',
-        ]
+        ],
+        stdout=subprocess.PIPE,
     )
 
     # subject=O = jplochocki.github.io, OU = PYConnect, CN = e0f7faa7...

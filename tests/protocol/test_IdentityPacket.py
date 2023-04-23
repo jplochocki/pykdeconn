@@ -1,10 +1,8 @@
 from pathlib import Path
 import json
 
-
 import pytest
 from pydantic import ValidationError
-
 
 from pyconnect.protocol import (
     IdentityPacket,
