@@ -1,0 +1,29 @@
+name: CI
+on: [push]
+
+jobs:
+  tests:
+    name: pytest tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3.0.2
+      - name: Set up Python 3.9
+        uses: actions/setup-python@v4
+        with:
+          python-version: 3.9
+      - name: Run pytest
+        uses: fylein/python-pytest-github-action@v2
+        with:
+          args: |
+            pip install pyconnect[dev] &&
+            pytest tests -vvv --cov=./ --cov-report=xml
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3.1.0
+        with:
+          file: ./coverage.xml
+          flags: unittests
+          fail_ci_if_error: true
+          verbose: true
+
+
