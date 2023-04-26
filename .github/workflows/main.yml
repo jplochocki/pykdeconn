@@ -16,8 +16,11 @@ jobs:
         uses: fylein/python-pytest-github-action@v2
         with:
           args: |
-            pip3 install .[dev] &&
-            PYTEST_RUNNING=1 python3 -m pytest tests/ -vvv --cov=./ --cov-report=xml
+            pip install --upgrade pip &&
+            pip install setuptools build &&
+            python -m build &&
+            pip install .[dev] &&
+            PYTEST_RUNNING=1 python -m pytest tests/ -vvv --cov=./ --cov-report=xml
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3.1.0
         with:
