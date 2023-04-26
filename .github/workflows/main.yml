@@ -17,9 +17,9 @@ jobs:
         with:
           args: |
             pip install --upgrade pip &&
-            pip install setuptools build &&
+            pip install setuptools build pytest pytest-mock pytest-cov &&
             python -m build &&
-            pip install .[dev] &&
+            pip install dist/pykdeconn-1.0-py3-none-any.whl &&
             PYTEST_RUNNING=1 python -m pytest tests/ -vvv --cov=./ --cov-report=xml
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3.1.0
