@@ -4,7 +4,7 @@ import subprocess
 import re
 
 
-log = logging.getLogger('pyconnect.server')
+log = logging.getLogger('pykdeconn.server')
 
 
 def generate_cert(
@@ -40,7 +40,7 @@ def generate_cert(
             '-days',
             '3650',
             '-subj',
-            f'/O=jplochocki.github.io/OU=PyConnect/CN={device_id}',
+            f'/O=jplochocki.github.io/OU=PyKDEConn/CN={device_id}',
         ],
         stderr=subprocess.STDOUT,
         check=False,
@@ -75,7 +75,7 @@ def read_cert_common_name(cert_file: Path) -> str:
         stdout=subprocess.PIPE,
     )
 
-    # subject=O = jplochocki.github.io, OU = PYConnect, CN = e0f7faa7...
+    # subject=O = jplochocki.github.io, OU = PyKDEConn, CN = e0f7faa7...
     a = re.search(r'CN\s*=\s*([^,\n]*)', openssl.stdout.decode(), re.I)
     if not a:
         raise RuntimeError(

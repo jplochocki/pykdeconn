@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest  # noqa
 
-from pyconnect.utils import simple_toml_parser
+from pykdeconn.utils import simple_toml_parser
 
 
 dconf_result_example = (

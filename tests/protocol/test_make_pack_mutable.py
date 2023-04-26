@@ -1,6 +1,6 @@
 from pathlib import Path
 import pytest
-from pyconnect.protocol import make_pack_mutable, IdentityPacket
+from pykdeconn.protocol import make_pack_mutable, IdentityPacket
 
 
 id_packet_example = (

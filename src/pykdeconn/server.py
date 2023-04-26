@@ -9,7 +9,7 @@ from .protocol import (
 )
 
 
-log = logging.getLogger('pyconnect.server')
+log = logging.getLogger('pykdeconn.server')
 
 
 async def server_main():

@@ -11,7 +11,7 @@ from .packets import IdentityPacket
 from ..settings import DeviceConfig
 
 
-log = logging.getLogger('pyconnect.server')
+log = logging.getLogger('pykdeconn.server')
 
 
 async def wait_for_incoming_id(

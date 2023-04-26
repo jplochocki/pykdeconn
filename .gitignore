@@ -138,3 +138,4 @@ pyconnect.config.json
 gnome-shell-extension-gsconnect/
 temp/
 tags
+tests/config/

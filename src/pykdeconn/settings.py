@@ -29,7 +29,7 @@ logging.config.dictConfig(
         'version': 1,
         'disable_existing_loggers': True,
         'loggers': {
-            'pyconnect.server': {
+            'pykdeconn.server': {
                 'level': 'DEBUG',
                 'handlers': ['detailed_console_handler'],
                 'propagate': True,
@@ -44,14 +44,14 @@ logging.config.dictConfig(
         },
         'formatters': {
             'detailed_console_handler_fmt': {
-                'class': 'pyconnect.utils.CustomConsoleFormatter'
+                'class': 'pykdeconn.utils.CustomConsoleFormatter'
             }
         },
     }
 )
 
 
-log = logging.getLogger('pyconnect.server')
+log = logging.getLogger('pykdeconn.server')
 
 
 class InvalidPEMFormatError(PydanticValueError):
@@ -113,21 +113,21 @@ class DeviceConfig(BaseModel):
         return dev
 
 
-class PyConnectSettingsSourceDir(BaseSettings):
+class PyKDEConnSettingsSourceDir(BaseSettings):
     """
     Settings directory (default or from environmet variables).
     """
 
     config_dir: Path = Field(
-        env='PYCONNECT_CONFIG_DIR',
-        default_factory=lambda: PyConnectSettingsSourceDir.config_dir_default_factory(),  # noqa
+        env='PYKDECONN_CONFIG_DIR',
+        default_factory=lambda: PyKDEConnSettingsSourceDir.config_dir_default_factory(),  # noqa
     )
 
     @staticmethod
     def config_dir_default_factory() -> Path:
         """
-        Creates config directory path (``~/.config/pyconnect`` if ``~/.config``
-        exists or ``~/.pyconnect`` else). If we're running in pytest
+        Creates config directory path (``~/.config/pykdeconn`` if ``~/.config``
+        exists or ``~/.pykdeconn`` else). If we're running in pytest
         environment - return tests/config path.
         """
         if running_in_pytest():
@@ -140,9 +140,9 @@ class PyConnectSettingsSourceDir(BaseSettings):
                 return tests_dir / 'config'
 
         if Path('~/.config').expanduser().exists():
-            return Path('~/.config/pyconnect').expanduser()
+            return Path('~/.config/pykdeconn').expanduser()
         else:
-            return Path('~/.pyconnect').expanduser()
+            return Path('~/.pykdeconn').expanduser()
 
     @validator('config_dir')
     def create_dir_if_not_exists(cls, p: Path) -> Path:
@@ -153,7 +153,7 @@ class PyConnectSettingsSourceDir(BaseSettings):
         return p
 
 
-config_source_dir = PyConnectSettingsSourceDir()
+config_source_dir = PyKDEConnSettingsSourceDir()
 config_file = config_source_dir.config_dir / 'config.json'
 
 
@@ -168,7 +168,7 @@ def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
         return {}
 
 
-class PyConnectSettings(BaseSettings):
+class PyKDEConnSettings(BaseSettings):
     log_level: Literal[
         logging.CRITICAL,
         logging.ERROR,
@@ -201,7 +201,7 @@ class PyConnectSettings(BaseSettings):
         (
             device_certfile,
             _,
-        ) = PyConnectSettings.gen_cert_files_paths(values['device_name'])
+        ) = PyKDEConnSettings.gen_cert_files_paths(values['device_name'])
         if device_certfile.exists():
             return read_cert_common_name(device_certfile)
         else:
@@ -219,7 +219,7 @@ class PyConnectSettings(BaseSettings):
         if isinstance(v, Path):
             return v.resolve()
         else:
-            return PyConnectSettings.gen_cert_files_paths(
+            return PyKDEConnSettings.gen_cert_files_paths(
                 values['device_name']
             )[0]
 
@@ -231,7 +231,7 @@ class PyConnectSettings(BaseSettings):
             (
                 device_certfile,
                 device_keyfile,
-            ) = PyConnectSettings.gen_cert_files_paths(values['device_name'])
+            ) = PyKDEConnSettings.gen_cert_files_paths(values['device_name'])
 
         # create certs files if don't exists
         if not device_keyfile.exists() or not device_certfile.exists():
@@ -273,7 +273,7 @@ class PyConnectSettings(BaseSettings):
         config_file.write_text(json.dumps(a, indent=4), encoding=encoding)
 
     class Config:
-        env_prefix = 'PYCONNECT_'
+        env_prefix = 'PYKDECONN_'
         env_file_encoding = 'utf-8'
 
         @classmethod
@@ -291,7 +291,7 @@ class PyConnectSettings(BaseSettings):
             )
 
 
-config = PyConnectSettings()
+config = PyKDEConnSettings()
 if not config_file.exists():
     config.save()
 

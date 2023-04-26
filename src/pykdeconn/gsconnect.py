@@ -5,7 +5,7 @@ import re
 import logging
 
 
-log = logging.getLogger('pyconnect.server')
+log = logging.getLogger('pykdeconn.server')
 
 
 def is_running() -> Union[int, bool]:

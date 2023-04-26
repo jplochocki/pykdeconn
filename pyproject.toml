@@ -3,7 +3,7 @@ requires = ["setuptools"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "pyconnect"
+name = "pykdeconn"
 version = "1.0"
 description = "Simple KDE Connect client protocol implementation in Python"
 readme = {file = "README.md", content-type = "text/markdown"}
@@ -30,8 +30,8 @@ requires-python = ">=3.9"
 
 [project.urls]
 homepage = "https://jplochocki.github.io/"
-documentation = "https://github.com/jplochocki/pyconnect"
-repository = "https://github.com/jplochocki/pyconnect"
+documentation = "https://github.com/jplochocki/pykdeconn"
+repository = "https://github.com/jplochocki/pykdeconn"
 
 [project.optional-dependencies]
 dev = [
@@ -43,5 +43,5 @@ dev = [
 ]
 
 [project.scripts]
-pyconnect = "pyconnect:client_main"
-pyconnect-server = "pyconnect:server_main"
+pykdeconn = "pykdeconn:client_main"
+pykdeconn-server = "pykdeconn:server_main"

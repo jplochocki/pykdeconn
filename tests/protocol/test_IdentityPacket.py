@@ -4,7 +4,7 @@ import json
 import pytest
 from pydantic import ValidationError
 
-from pyconnect.protocol import (
+from pykdeconn.protocol import (
     IdentityPacket,
     generate_IdentityPacket,
     KDE_CONNECT_PROTOCOL_VERSION,

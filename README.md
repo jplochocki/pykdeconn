@@ -1,7 +1,7 @@
-# PyConnect
+# PyKDEConn
 
-![](https://img.shields.io/github/license/jplochocki/pyconnect)
+![](https://img.shields.io/github/license/jplochocki/pykdeconn)
 
 
 
-Simple KDE Connect client protocol implementation in Python
+Simple KDE Connect client protocol implementation in Python.

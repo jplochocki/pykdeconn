@@ -1,5 +1,6 @@
 import logging
 import sys
+import os
 from pathlib import Path
 from typing import Dict, Any
 import re
@@ -36,6 +37,9 @@ def running_in_pytest() -> bool:
     """
     Checking if we're running in pytest.
     """
+    if 'PYTEST_RUNNING' in os.environ:
+        return True
+    
     p = Path(sys.argv[0])
     return p.name in ['pytest', 'py.test'] or p.match(
         '*/site-packages/pytest/__main__.py'
