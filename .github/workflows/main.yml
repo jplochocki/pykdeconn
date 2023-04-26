@@ -15,7 +15,7 @@ jobs:
       - run: |
             echo "check python version" &&
             python -V &&
-            pip install . &&
+            pip install .[dev] &&
             PYTEST_RUNNING=1 python -m pytest tests/ -vvv --cov=./ --cov-report=xml
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v3.1.0
