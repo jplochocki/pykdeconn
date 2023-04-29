@@ -14,3 +14,8 @@ outgoing-capabilities=['kdeconnect.battery', 'kdeconnect.battery.request', 'kdec
 paired=true
 supported-plugins=['battery', 'clipboard', 'connectivity_report', 'contacts', 'findmyphone', 'mousepad', 'mpris', 'notification', 'photo', 'ping', 'presenter', 'runcommand', 'sftp', 'share', 'sms', 'systemvolume', 'telephony']
 type='phone'
+custom-battery-notification-value=uint32 80
+wrong-list-of-strings=['kdeconnect.battery',...]
+
+[]
+unnamed-group-should-not-be-in-list=true

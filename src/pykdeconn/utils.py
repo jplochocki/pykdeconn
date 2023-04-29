@@ -39,7 +39,7 @@ def running_in_pytest() -> bool:
     """
     if 'PYTEST_RUNNING' in os.environ:
         return True
-    
+
     p = Path(sys.argv[0])
     return p.name in ['pytest', 'py.test'] or p.match(
         '*/site-packages/pytest/__main__.py'
@@ -48,39 +48,47 @@ def running_in_pytest() -> bool:
 
 def simple_toml_parser(txt: str) -> Dict[str, Any]:
     """
-    Simple TOML (like) parser. dconf returns TOML-like string
+    "Just enough" TOML parser for parsing dconf results. A typical TOML parser
+    breaks at sections with "/".
     """
     res = {}
     last_section = None
     for ln in txt.splitlines():
         # sections
-        if m := (re.match(r'^\s*\[\s*(.+)\s*\]\s*$', ln)):
-            last_section = m.group(1)
-            res[last_section] = {}
+        if m := (re.match(r'^\s*\[\s*(.*?)\s*\]\s*$', ln)):
+            if not m.group(1):
+                last_section = None
+                continue
+
+            res[m.group(1)] = last_section = {}
 
         # values
-        elif m := (re.match(r'^\s*(?P<name>.+)\s*=\s*(?P<value>.+)$', ln)):
+        elif last_section is not None and (
+            m := (re.match(r'^\s*(?P<name>.+?)\s*=\s*(?P<value>.+)$', ln))
+        ):
             name = m.group('name')
             value = m.group('value')
 
             # bool
             if m := (re.match(r'^\s*(true|false)\s*$', value, re.I)):
-                res[last_section][name] = bool(
-                    re.match('true', m.group(1), re.I)
-                )
+                last_section[name] = bool(re.match('true', m.group(1), re.I))
 
             # string
             elif m := (re.match(r'^\s*(\'|")(.+?)(\1)\s*$', value)):
-                res[last_section][name] = m.group(2)
+                last_section[name] = m.group(2)
 
             # list of strings
             elif m := (re.match(r'^\s*(\[\s*.*?\s*\])\s*$', value)):
-                res[last_section][name] = json.loads(
-                    re.sub(r'(?<!\\)\'', '"', m.group(1)))
+                try:
+                    last_section[name] = json.loads(
+                        re.sub(r'(?<!\\)\'', '"', m.group(1))
+                    )
+                except json.JSONDecodeError:
+                    pass
 
             # uint32
             elif m := (re.match(r'^\s*uint32\s+(\d+)\s*$', value, re.I)):
-                res[last_section][name] = int(m.group(1))
+                last_section[name] = int(m.group(1))
 
             # just ignore anything you don't know
     return res

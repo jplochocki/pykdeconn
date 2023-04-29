@@ -4,18 +4,19 @@ import subprocess
 import re
 import logging
 
+from anyio import run_process
+
 
 log = logging.getLogger('pykdeconn.server')
 
 
-def is_running() -> Union[int, bool]:
+async def is_running() -> Union[int, bool]:
     """
     Checks if the ``GSConnect`` extension is running (and returns its PID
     or False otherwise)
     """
-    gsconnect = subprocess.run(
+    gsconnect = await run_process(
         'ps ax | grep gsconnect@andyholmes.github.io',
-        shell=True,
         stdout=subprocess.PIPE,
     )
 
