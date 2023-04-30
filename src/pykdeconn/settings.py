@@ -56,7 +56,7 @@ log = logging.getLogger('pykdeconn.server')
 
 class InvalidPEMFormatError(PydanticValueError):
     code = 'invalid_PEM_format'
-    message = 'Invalid PEM Certificate format'
+    msg_template = 'Invalid PEM Certificate format'
 
 
 class DeviceConfig(BaseModel):
@@ -73,16 +73,20 @@ class DeviceConfig(BaseModel):
     def cert_str_format_or_empty(cls, value: str) -> str:
         if value == '':
             return value
+
         if not re.match(
             (
-                r'^-----BEGIN CERTIFICATE-----\n[A-Za-z0-9\+\/=]+\n'
-                r'-----END CERTIFICATE-----\n?'
+                r'^\s*-----BEGIN CERTIFICATE-----\n[A-Za-z0-9\+\/=\n]+\n'
+                r'-----END CERTIFICATE-----\s*$'
             ),
             value,
         ):
             raise InvalidPEMFormatError(pem_value=value)
 
+        return value
+
     paired: bool = False
+    type_: str = 'phone'
     last_ip: Optional[IPvAnyAddress] = None
     last_connection_date: PastDate = Field(
         default_factory=lambda: datetime.datetime.now()
@@ -175,20 +179,41 @@ class PyKDEConnSettings(BaseSettings):
         logging.WARNING,
         logging.INFO,
         logging.DEBUG,
+        'CRITICAL',
+        'ERROR',
+        'WARNING',
+        'INFO',
+        'DEBUG',
     ] = logging.DEBUG
 
     @validator('log_level', always=True)
     def log_level_set(cls, v):
-        if v not in [
-            logging.CRITICAL,
-            logging.ERROR,
-            logging.WARNING,
-            logging.INFO,
-            logging.DEBUG,
-        ]:
+        named_lvls = {
+            'CRITICAL': logging.CRITICAL,
+            'ERROR': logging.ERROR,
+            'WARNING': logging.WARNING,
+            'INFO': logging.INFO,
+            'DEBUG': logging.DEBUG,
+        }
+
+        if (
+            v
+            not in [
+                logging.CRITICAL,
+                logging.ERROR,
+                logging.WARNING,
+                logging.INFO,
+                logging.DEBUG,
+            ]
+            and v not in named_lvls.keys()
+        ):
             raise ValueError(f'Invalid log_level value ({v}).')
-        log.setLevel(v)
-        return v
+        if v in named_lvls.keys():
+            log.setLevel(named_lvls[v])
+            return v
+        else:
+            log.setLevel(v)
+            return [k for k, a in named_lvls.items() if a == v][0]
 
     device_name: str = Field(default_factory=socket.gethostname)
     device_id: str = ''

@@ -9,7 +9,7 @@ from pykdeconn.utils import running_in_pytest, simple_toml_parser
 
 
 dconf_result_example = (
-    Path(__file__).parent / 'examples' / 'dconf-result-example.txt'
+    Path(__file__).parent / 'fixtures' / 'dconf-result-example.txt'
 )
 
 

@@ -75,7 +75,7 @@ def simple_toml_parser(txt: str) -> Dict[str, Any]:
 
             # string
             elif m := (re.match(r'^\s*(\'|")(.+?)(\1)\s*$', value)):
-                last_section[name] = m.group(2)
+                last_section[name] = re.sub(r'\\n', '\n', m.group(2))
 
             # list of strings
             elif m := (re.match(r'^\s*(\[\s*.*?\s*\])\s*$', value)):

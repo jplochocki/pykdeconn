@@ -13,7 +13,7 @@ from pykdeconn.protocol import (
 
 
 id_packet_example = (
-    Path(__file__).parent / 'examples' / 'kdeconnect.identity.json'
+    Path(__file__).parent / 'fixtures' / 'kdeconnect.identity.json'
 )
 
 
