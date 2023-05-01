@@ -5,7 +5,11 @@ from .consts import (
     KDE_CONNECT_PROTOCOL_VERSION,
 )
 from .packets import IdentityPacket, generate_IdentityPacket, make_pack_mutable
-from .connection import wait_for_incoming_id, make_outgoing_connection
+from .connection import (
+    KDEConnectPortBusy,
+    wait_for_incoming_ids_task,
+    outgoing_connection_task,
+)
 
 
 __all__ = (
@@ -16,6 +20,7 @@ __all__ = (
     'IdentityPacket',
     'generate_IdentityPacket',
     'make_pack_mutable',
-    'wait_for_incoming_id',
-    'make_outgoing_connection',
+    'KDEConnectPortBusy',
+    'wait_for_incoming_ids_task',
+    'outgoing_connection_task',
 )

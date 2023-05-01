@@ -12,8 +12,10 @@ from pykdeconn.gsconnect import (
     gen_cert_files_paths,
     list_device_names_and_ids,
     read_device_config,
+    generate_identity_params,
 )
 from pykdeconn.settings import DeviceConfig
+from pykdeconn.protocol import IdentityPacket, generate_IdentityPacket
 
 
 dconf_result_example = (
@@ -79,7 +81,7 @@ async def test_try_kill(mocker):
 
     # error catching
     run_process_mock.side_effect = subprocess.CalledProcessError(
-        returncode=1, cmd='xxx'
+        returncode=1, cmd='lorem-ipsum-dolor'
     )
     assert not await try_kill()
 
@@ -152,3 +154,33 @@ async def test_read_device_config(mocker):
     # unknown device
     result = await read_device_config('Lorem ipsum dolor')
     assert type(result) == dict and result == {}
+
+
+@pytest.mark.anyio
+async def test_generate_identity_params(mocker):
+    run_process_mock = AsyncMock()
+    run_process_stdout = run_process_mock.stdout = MagicMock()
+    run_process_stdout.decode.return_value = dconf_result_example.read_text()
+    mocker.patch(
+        'pykdeconn.gsconnect.run_process', return_value=run_process_mock
+    )
+
+    result = await generate_identity_params()
+
+    run_process_stdout.decode.assert_called_once()
+
+    assert result['device_id'] == '00392cd2-329e-4ad6-9766-019a304b32f9'
+    assert result['device_name'] == 'systemik-dell'
+
+    # generate id packet test
+    id_pack = generate_IdentityPacket(**result)
+
+    assert isinstance(id_pack, IdentityPacket)
+    assert id_pack.body.deviceId == '00392cd2-329e-4ad6-9766-019a304b32f9'
+    assert id_pack.body.deviceName == 'systemik-dell'
+
+    # no '/' section
+    run_process_stdout.decode.return_value = ''
+    result = await generate_identity_params()
+
+    assert result == {}

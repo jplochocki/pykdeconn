@@ -8,6 +8,7 @@ from pathlib import Path
 import json
 import sys
 import uuid
+import ssl
 
 from pydantic import (
     BaseModel,
@@ -17,11 +18,15 @@ from pydantic import (
     PydanticValueError,
     IPvAnyAddress,
     PastDate,
+    PrivateAttr,
 )
+
+# from anyio.streams.tls import TLSStream
 
 from .protocol.packets import IdentityPacket, generate_IdentityPacket
 from .utils import running_in_pytest
-from .sslutils import generate_cert, read_cert_common_name
+
+# from .sslutils import generate_cert, read_cert_common_name
 
 
 logging.config.dictConfig(
@@ -91,6 +96,8 @@ class DeviceConfig(BaseModel):
     last_connection_date: PastDate = Field(
         default_factory=lambda: datetime.datetime.now()
     )
+    _connected: bool = PrivateAttr(False)
+    _connection_ssock: Optional[Any] = PrivateAttr(None)  # TLSStream
 
     incoming_capabilities: List[str] = []
     outgoing_capabilities: List[str] = []
@@ -115,6 +122,39 @@ class DeviceConfig(BaseModel):
         dev.outgoing_capabilities = pack.body.outgoingCapabilities.copy()
 
         return dev
+
+    _ssl_cnx_cache: Dict[str, Any] = PrivateAttr(default_factory=dict)
+
+    def ssl_context(
+        self,
+        purpose: ssl.Purpose = ssl.Purpose.CLIENT_AUTH,
+        my_device_certfile: Optional[Path] = None,
+        my_device_keyfile: Optional[Path] = None,
+        renew: bool = False,
+    ) -> ssl.SSLContext:
+        """
+        Loads ``SSLContext`` for the specified ``purpose``.
+        """
+        if not renew and purpose.shortname in self._ssl_cnx_cache:
+            return self._ssl_cnx_cache[purpose.shortname]
+
+        cnx = ssl.create_default_context(purpose)
+        cnx.load_cert_chain(
+            certfile=my_device_certfile, keyfile=my_device_keyfile
+        )
+
+        cnx.check_hostname = False
+        cnx.verify_mode = ssl.CERT_NONE
+
+        if self.certificate_PEM:
+            cnx.load_verify_locations(cadata=self.certificate_PEM)
+            cnx.verify_mode = ssl.CERT_REQUIRED
+
+        self._ssl_cnx_cache[purpose.shortname] = cnx
+        return cnx
+
+    def save(self):
+        pass
 
 
 class PyKDEConnSettingsSourceDir(BaseSettings):
@@ -228,7 +268,8 @@ class PyKDEConnSettings(BaseSettings):
             _,
         ) = PyKDEConnSettings.gen_cert_files_paths(values['device_name'])
         if device_certfile.exists():
-            return read_cert_common_name(device_certfile)
+            # return read_cert_common_name(device_certfile)
+            return ''
         else:
             return uuid.uuid4().urn.replace('urn:uuid:', '')
 
@@ -260,12 +301,13 @@ class PyKDEConnSettings(BaseSettings):
 
         # create certs files if don't exists
         if not device_keyfile.exists() or not device_certfile.exists():
-            generate_cert(
-                values['device_name'],
-                values['device_id'],
-                device_certfile,
-                device_keyfile,
-            )
+            # generate_cert(
+            #     values['device_name'],
+            #     values['device_id'],
+            #     device_certfile,
+            #     device_keyfile,
+            # )
+            pass
 
         return device_keyfile.resolve()
 

@@ -153,3 +153,35 @@ async def read_device_config(dev_id) -> Dict[str, str]:
             ret[dest_key] = m.group('ip')
 
     return ret
+
+
+async def generate_identity_params(
+    incoming_capabilities: List[str] = [],
+    outgoing_capabilities: List[str] = [],
+    device_type: str = 'laptop',
+) -> Dict[str, str]:
+    """
+    Generates parameters for protocol.generate_IdentityPacket() call
+    with the name and ID from the GSConnect configuration.
+    """
+    result = (
+        await run_process(
+            'dconf dump /org/gnome/shell/extensions/gsconnect/',
+            stdout=subprocess.PIPE,
+        )
+    ).stdout.decode()
+
+    log.debug(f'run_process output: {result}')
+
+    result = simple_toml_parser(result)
+
+    if '/' not in result:
+        return {}
+
+    return {
+        'device_id': result['/'].get('id', ''),
+        'device_name': result['/'].get('name', ''),
+        'incoming_capabilities': incoming_capabilities,
+        'outgoing_capabilities': outgoing_capabilities,
+        'device_type': device_type,
+    }

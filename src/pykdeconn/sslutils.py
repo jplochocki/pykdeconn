@@ -3,12 +3,13 @@ from pathlib import Path
 import subprocess
 import re
 
+from anyio import run_process
+
 
 log = logging.getLogger('pykdeconn.server')
 
 
-def generate_cert(
-    device_name: str,
+async def generate_cert(
     device_id: str,
     device_certfile: Path,
     device_keyfile: Path,
@@ -16,14 +17,7 @@ def generate_cert(
     """
     Generates ``SSL`` certificate files.
     """
-    log.debug(
-        (
-            f'Generating certs for {device_name} / {device_id} '
-            f'({device_certfile} and {device_keyfile})'
-        )
-    )
-
-    openssl = subprocess.run(
+    await run_process(
         [
             'openssl',
             'req',
@@ -42,46 +36,46 @@ def generate_cert(
             '-subj',
             f'/O=jplochocki.github.io/OU=PyKDEConn/CN={device_id}',
         ],
-        stderr=subprocess.STDOUT,
-        check=False,
+        check=True,
     )
 
-    if openssl.returncode != 0:
-        raise RuntimeError(
-            (
-                f'OpenSSL returned an error code ({openssl.returncode})\n'
-                f'{openssl.stdout.decode()}'
-            )
+    log.debug(
+        (
+            f'Certificate files ({device_certfile} and {device_keyfile}) '
+            f'generated for id {device_id}.'
         )
+    )
 
-    log.info(f'Cert generated for {device_name} / {device_id}')
 
-
-def read_cert_common_name(cert_file: Path) -> str:
+async def read_cert_common_name(cert_file: Path) -> str:
     """
     Reads ``CN`` field from ``SSL`` certificate.
     """
-    openssl = subprocess.run(
-        [
-            'openssl',
-            'x509',
-            '-in',
-            cert_file,
-            '-noout',
-            '-subject',
-            '-inform',
-            'pem',
-        ],
-        stdout=subprocess.PIPE,
-    )
+    result = (
+        await run_process(
+            [
+                'openssl',
+                'x509',
+                '-in',
+                cert_file,
+                '-noout',
+                '-subject',
+                '-inform',
+                'pem',
+            ],
+            stdout=subprocess.PIPE,
+            check=True,
+        )
+    ).stdout.decode()
+
+    log.debug(f'run_process output: {result}')
 
     # subject=O = jplochocki.github.io, OU = PyKDEConn, CN = e0f7faa7...
-    a = re.search(r'CN\s*=\s*([^,\n]*)', openssl.stdout.decode(), re.I)
-    if not a:
-        raise RuntimeError(
-            f'Invalid cert CN string ({openssl.stdout.decode()})'
-        )
-    a = a.group(1)
-    log.info(f'Certificate\'s CN name readed: {cert_file} = {a}')
+    m = re.search(r'CN\s*=\s*([^,\n]*)', result, re.I)
+    if not m:
+        return None
 
-    return a
+    m = m.group(1)
+    log.info(f'Certificate\'s CN name readed: {cert_file} = {m}')
+
+    return m
