@@ -27,16 +27,32 @@ log = logging.getLogger('pykdeconn.server')
 
 
 async def server_main():
-    my_id_pack = generate_IdentityPacket(
-        **(
+    # my_id_pack = generate_IdentityPacket(
+    #     **(
+    #         await gsconnect_identity_params(
+    #             incoming_capabilities=['kdeconnect.share.request'],
+    #             outgoing_capabilities=['kdeconnect.share.request'],
+    #         )
+    #     )
+    # )
+    # ignore_device_ids = [my_id_pack.body.deviceId]
+    # my_device_certfile, my_device_keyfile = gsconnect_cert_files_paths()
+
+    a = (
             await gsconnect_identity_params(
                 incoming_capabilities=['kdeconnect.share.request'],
                 outgoing_capabilities=['kdeconnect.share.request'],
             )
         )
+    a['device_id'] = '2b90c70b-fd45-4da9-b8db-c84e95d686d7'
+    my_id_pack = generate_IdentityPacket(
+        **a
     )
     ignore_device_ids = [my_id_pack.body.deviceId]
     my_device_certfile, my_device_keyfile = gsconnect_cert_files_paths()
+
+    my_device_certfile = '/home/systemik/github/pykdeconn/env_3.9/certificate-systemik-dell.pem'  # noqa
+    my_device_keyfile = '/home/systemik/github/pykdeconn/env_3.9/private-systemik-dell.pem'  # noqa
 
     async with create_task_group() as main_group:
         # receiving new ids
@@ -57,7 +73,6 @@ async def server_main():
         remote_dev_config = DeviceConfig.parse_obj(
             await gsconnect_device_config(remote_id_pack.body.deviceId)
         )
-        print('1', remote_dev_config, remote_ip, remote_id_pack)
 
         pack_sender, pack_receiver = create_memory_object_stream()
         main_group.start_soon(

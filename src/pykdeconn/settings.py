@@ -147,7 +147,9 @@ class DeviceConfig(BaseModel):
         cnx.verify_mode = ssl.CERT_NONE
 
         if self.certificate_PEM:
-            cnx.load_verify_locations(cadata=self.certificate_PEM)
+            cnx.load_verify_locations(
+                cadata=ssl.PEM_cert_to_DER_cert(self.certificate_PEM)
+            )
             cnx.verify_mode = ssl.CERT_REQUIRED
 
         self._ssl_cnx_cache[purpose.shortname] = cnx

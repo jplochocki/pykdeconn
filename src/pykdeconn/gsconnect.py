@@ -9,7 +9,7 @@ from anyio import run_process
 from .utils import simple_toml_parser
 
 
-log = logging.getLogger('pykdeconn.server')
+log = logging.getLogger('pykdeconn.gsconnect')
 
 
 async def is_running() -> Union[int, bool]:
