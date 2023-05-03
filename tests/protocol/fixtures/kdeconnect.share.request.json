@@ -1,0 +1,14 @@
+{
+    "id": 1645343489598,
+    "type": "kdeconnect.share.request",
+    "body":{
+        "filename": "Screenshot_2022-02-07-23-30-00-849_com.facebook.lite.jpg",
+        "lastModified": 1644273001000,
+        "numberOfFiles": 2,
+        "totalPayloadSize": 310309
+    },
+    "payloadSize": 260509,
+    "payloadTransferInfo": {
+        "port": 1739
+    }
+}

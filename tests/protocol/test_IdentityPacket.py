@@ -77,3 +77,13 @@ def test_generate_IdentityPacket():
         'lorem.ipsum.dolor4',
     ]
     assert idp.body.tcpPort == KDE_CONNECT_DEFAULT_PORT
+
+    # empty device_id test
+    with pytest.raises(ValidationError):
+        idp = generate_IdentityPacket(
+            device_id='',
+            device_name='lorem.ipsum.dolor device',
+            device_type='desktop',
+            incoming_capabilities=['lorem.ipsum.dolor1', 'lorem.ipsum.dolor2'],
+            outgoing_capabilities=['lorem.ipsum.dolor3', 'lorem.ipsum.dolor4'],
+        )

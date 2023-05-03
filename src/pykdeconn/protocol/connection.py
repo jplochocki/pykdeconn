@@ -1,11 +1,10 @@
 import socket
-from typing import Tuple, List, Dict, Any, Union
+from typing import Tuple, Dict, Any, Union
 import logging
 import errno
 import ssl
 from pathlib import Path
 import datetime
-import json
 
 from anyio import (
     create_udp_socket,
@@ -13,7 +12,9 @@ from anyio import (
     sleep,
     EndOfStream,
     IncompleteRead,
+    TASK_STATUS_IGNORED,
 )
+from anyio.abc import TaskStatus
 from anyio.streams.tls import TLSStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from anyio.streams.memory import MemoryObjectSendStream
@@ -21,7 +22,7 @@ from pydantic import ValidationError, IPvAnyAddress
 
 
 from .consts import KDE_CONNECT_DEFAULT_PORT
-from .packets import IdentityPacket
+from .packets import UnknownPacket, IdentityPacket, get_packet_by_kde_type_name
 from ..settings import DeviceConfig
 
 
@@ -36,7 +37,6 @@ async def wait_for_incoming_ids_task(
     new_id_sender: MemoryObjectSendStream[
         Tuple[IPvAnyAddress, IdentityPacket]
     ],
-    ignore_device_ids: List = [],
 ):
     """
     Listens on ``UDP Broadcast`` for incoming device ID packets.
@@ -47,7 +47,7 @@ async def wait_for_incoming_ids_task(
             local_host='255.255.255.255',
             local_port=KDE_CONNECT_DEFAULT_PORT,
             reuse_port=True,
-        ) as udp_sock:
+        ) as udp_sock, new_id_sender:
             async for data, (remote_ip, remote_port) in udp_sock:
                 try:
                     pack = IdentityPacket.parse_raw(data.decode('utf-8'))
@@ -60,9 +60,6 @@ async def wait_for_incoming_ids_task(
                     )
                     continue
 
-                if pack.body.deviceId in ignore_device_ids:
-                    continue
-
                 log.debug(
                     (
                         f'Id packet received: {pack.body.deviceName} / '
@@ -70,8 +67,7 @@ async def wait_for_incoming_ids_task(
                     )
                 )
 
-                async with new_id_sender:
-                    await new_id_sender.send((remote_ip, pack))
+                await new_id_sender.send((remote_ip, pack))
     except OSError as e:
         if e.errno == errno.EADDRINUSE:
             raise KDEConnectPortBusy()
@@ -87,16 +83,20 @@ async def outgoing_connection_task(
     my_device_certfile: Path,
     my_device_keyfile: Path,
     incoming_pack_sender: MemoryObjectSendStream[Tuple[DeviceConfig, Any]],
+    *,
+    task_status: TaskStatus = TASK_STATUS_IGNORED,
 ):
     """
-    Outgoing conection to the known device.
+    Outgoing conection (to the known device).
     """
     dev_debug_id = (
         f'{remote_ip}:{remote_port} ({remote_dev_config.device_name})'
     )
 
     # connect
-    async with await connect_tcp(remote_ip, remote_port) as sock:
+    async with await connect_tcp(
+        remote_ip, remote_port
+    ) as sock, incoming_pack_sender:
         log.debug(f'Connected to {dev_debug_id}')
         remote_dev_config.last_ip = remote_ip
         remote_dev_config.last_connection_date = datetime.datetime.now()
@@ -107,7 +107,6 @@ async def outgoing_connection_task(
 
         # wrap TLS
         try:
-            # ipdb.set_trace()
             ssock = await TLSStream.wrap(
                 sock,
                 server_side=True,
@@ -130,11 +129,13 @@ async def outgoing_connection_task(
             remote_dev_config.paired = False
             remote_dev_config.certificate_PEM = ''
             remote_dev_config.save()
-            return
+
+            raise RuntimeError('Not connected')  # TODO
 
         remote_dev_config._connection_ssock = ssock
         remote_dev_config._connected = True
         log.debug(f'Wrapped TLS connection with {dev_debug_id}.')
+        task_status.started()
 
         # handle pair if needed
         bssock = BufferedByteReceiveStream(ssock)
@@ -145,13 +146,13 @@ async def outgoing_connection_task(
             #     return
 
         # receiving packets
-        # main_group.start_soon(receive_contacts, dev_config)
-
         while True:
-            pack = await receive_packet(bssock)
+            pack = await receive_packet(bssock, dev_debug_id)
             if not pack:
-                await sleep(1)
+                await sleep(0.1)
                 continue
+
+            await incoming_pack_sender.send(pack)
 
             # if not await handle_packet(dev_config, pack, bssock, main_group):
             #     await on_device_disconnected(dev_config, ssock)
@@ -159,7 +160,7 @@ async def outgoing_connection_task(
 
 
 async def receive_packet(
-    bssock: BufferedByteReceiveStream,
+    bssock: BufferedByteReceiveStream, dev_debug_id: str
 ) -> Union[Dict, bool]:
     """
     Receiving and decoding a packet - the common part
@@ -169,15 +170,30 @@ async def receive_packet(
     except (EndOfStream, IncompleteRead):
         return False
     except Exception:
-        log.exception('Error while receiving packet.')
+        log.exception(f'Error while receiving packet from {dev_debug_id}.')
         return False
 
     try:
-        pack = json.loads(pack_data)
-    except json.JSONDecodeError:
-        log.exception(f'Error while decoding packet\n{pack_data}')
-        return False
+        pack = UnknownPacket.parse_raw(pack_data)
 
-    log.debug(f'Received packet:\n{pack!r}')
+        cls = get_packet_by_kde_type_name(pack.type)
 
-    return pack
+        is_known = 'known' if cls is UnknownPacket else 'unknown'
+        log.debug(
+            (
+                f'Received packet type {pack.type} ({is_known}) '
+                f'from {dev_debug_id}.'
+            )
+        )
+
+        # handle only known packets
+        if cls is UnknownPacket:
+            return False
+
+        return cls.parse_raw(pack_data)
+    except ValidationError:
+        log.exception(
+            f'Error while decoding packet from {dev_debug_id}\n{pack_data}'
+        )
+
+    return False
