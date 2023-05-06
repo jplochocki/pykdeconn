@@ -5,14 +5,15 @@ from .consts import (
     KDE_CONNECT_PROTOCOL_VERSION,
 )
 from .packets import (
+    KDEConnectPacket,
     UnknownPacket,
     IdentityPacket,
-    generate_IdentityPacket,
+    PairPacket,
     ShareRequestPacket,
-    generate_ShareRequestPacket,
     get_packet_by_kde_type_name,
     make_pack_mutable,
 )
+from .deviceconfig import RemoteDeviceConfig
 from .connection import (
     KDEConnectPortBusy,
     wait_for_incoming_ids_task,
@@ -27,9 +28,9 @@ __all__ = (
     'KDE_CONNECT_PROTOCOL_VERSION',
     'UnknownPacket',
     'IdentityPacket',
-    'generate_IdentityPacket',
+    'PairPacket',
     'ShareRequestPacket',
-    'generate_ShareRequestPacket',
+    'RemoteDeviceConfig',
     'KDEConnectPortBusy',
     'wait_for_incoming_ids_task',
     'outgoing_connection_task',

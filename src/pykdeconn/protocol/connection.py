@@ -1,10 +1,9 @@
 import socket
-from typing import Tuple, Dict, Any, Union
+from typing import Tuple, Union
 import logging
 import errno
 import ssl
 from pathlib import Path
-import datetime
 
 from anyio import (
     create_udp_socket,
@@ -14,7 +13,7 @@ from anyio import (
     IncompleteRead,
     TASK_STATUS_IGNORED,
 )
-from anyio.abc import TaskStatus
+from anyio.abc import SocketStream, TaskStatus
 from anyio.streams.tls import TLSStream
 from anyio.streams.buffered import BufferedByteReceiveStream
 from anyio.streams.memory import MemoryObjectSendStream
@@ -22,8 +21,14 @@ from pydantic import ValidationError, IPvAnyAddress
 
 
 from .consts import KDE_CONNECT_DEFAULT_PORT
-from .packets import UnknownPacket, IdentityPacket, get_packet_by_kde_type_name
-from ..settings import DeviceConfig
+from .packets import (
+    KDEConnectPacket,
+    UnknownPacket,
+    IdentityPacket,
+    PairPacket,
+    get_packet_by_kde_type_name,
+)
+from .deviceconfig import RemoteDeviceConfig
 
 
 log = logging.getLogger('pykdeconn.server')
@@ -76,34 +81,27 @@ async def wait_for_incoming_ids_task(
 
 
 async def outgoing_connection_task(
-    remote_ip: IPvAnyAddress,
-    remote_port: int,
-    remote_dev_config: DeviceConfig,
+    remote_dev_config: RemoteDeviceConfig,
     my_id_pack: IdentityPacket,
     my_device_certfile: Path,
     my_device_keyfile: Path,
-    incoming_pack_sender: MemoryObjectSendStream[Tuple[DeviceConfig, Any]],
     *,
     task_status: TaskStatus = TASK_STATUS_IGNORED,
 ):
     """
-    Outgoing conection (to the known device).
+    Outgoing connection (to the device that sended ID to us)
     """
-    dev_debug_id = (
-        f'{remote_ip}:{remote_port} ({remote_dev_config.device_name})'
-    )
-
     # connect
     async with await connect_tcp(
-        remote_ip, remote_port
-    ) as sock, incoming_pack_sender:
-        log.debug(f'Connected to {dev_debug_id}')
-        remote_dev_config.last_ip = remote_ip
-        remote_dev_config.last_connection_date = datetime.datetime.now()
+        remote_dev_config.last_ip, remote_dev_config.remote_port
+    ) as sock, remote_dev_config.new_packet_sender:
+        log.debug(f'Connected to {remote_dev_config.get_debug_id()}')
 
         # send identity
-        await sock.send((my_id_pack.json() + '\n').encode('utf-8'))
-        log.debug(f'Identity packet sent to {dev_debug_id}.')
+        await sock.send(my_id_pack.prepare_to_send())
+        log.debug(
+            f'Identity packet sent to {remote_dev_config.get_debug_id()}.'
+        )
 
         # wrap TLS
         try:
@@ -120,51 +118,58 @@ async def outgoing_connection_task(
         except ssl.SSLCertVerificationError:
             log.exception(
                 (
-                    f'Cert verify failed with {dev_debug_id}'
-                    f' = treat us as unpaired.'
+                    'Certificate verification from '
+                    f'{remote_dev_config.get_debug_id()} failed. Treat Device'
+                    ' as unpaired and disconnect.'
                 )
             )
-            remote_dev_config._connected = False
-            remote_dev_config._connection_ssock = None
-            remote_dev_config.paired = False
-            remote_dev_config.certificate_PEM = ''
-            remote_dev_config.save()
+            remote_dev_config.on_unpair()
+            remote_dev_config.on_disconnect()
 
             raise RuntimeError('Not connected')  # TODO
 
-        remote_dev_config._connection_ssock = ssock
-        remote_dev_config._connected = True
-        log.debug(f'Wrapped TLS connection with {dev_debug_id}.')
+        remote_dev_config.on_connect(ssock)
+        log.debug(
+            f'Wrapped TLS connection with {remote_dev_config.get_debug_id()}.'
+        )
         task_status.started()
 
         # handle pair if needed
         bssock = BufferedByteReceiveStream(ssock)
-        if not remote_dev_config.paired:
-            pass
-            # if not await handle_pairing(dev_config, bssock):
-            #     await on_device_disconnected(dev_config, ssock)
-            #     return
+        if not remote_dev_config.paired and not await handle_pairing(
+            remote_dev_config
+        ):
+            await handle_device_disconnection(remote_dev_config)
+            return
 
         # receiving packets
         while True:
-            pack = await receive_packet(bssock, dev_debug_id)
+            pack = await receive_packet(remote_dev_config, bssock)
             if not pack:
                 await sleep(0.1)
                 continue
 
-            await incoming_pack_sender.send(pack)
+            if type(pack) is PairPacket:
+                if not await handle_pairing(
+                    remote_dev_config,
+                    received_pair_packet=pack,
+                ):
+                    await handle_device_disconnection(remote_dev_config)
+                    return
 
-            # if not await handle_packet(dev_config, pack, bssock, main_group):
-            #     await on_device_disconnected(dev_config, ssock)
-            #     break
+                continue
+
+            await remote_dev_config.new_packet_sender.send(pack)
 
 
 async def receive_packet(
-    bssock: BufferedByteReceiveStream, dev_debug_id: str
-) -> Union[Dict, bool]:
+    remote_dev_config: RemoteDeviceConfig, bssock: BufferedByteReceiveStream
+) -> Union[KDEConnectPacket, bool]:
     """
-    Receiving and decoding a packet - the common part
+    Receiving and decoding a packet - the common part.
     """
+    dev_debug_id = remote_dev_config.get_debug_id()
+
     try:
         pack_data = await bssock.receive_until(b'\n', 1024 * 1024 * 10)
     except (EndOfStream, IncompleteRead):
@@ -178,10 +183,10 @@ async def receive_packet(
 
         cls = get_packet_by_kde_type_name(pack.type)
 
-        is_known = 'known' if cls is UnknownPacket else 'unknown'
+        is_known = 'unknown' if cls is UnknownPacket else 'known'
         log.debug(
             (
-                f'Received packet type {pack.type} ({is_known}) '
+                f'Received {is_known} packet type {pack.type}'
                 f'from {dev_debug_id}.'
             )
         )
@@ -197,3 +202,67 @@ async def receive_packet(
         )
 
     return False
+
+
+async def handle_pairing(
+    remote_dev_config: RemoteDeviceConfig,
+    received_pair_packet: PairPacket = None,
+) -> bool:
+    """
+    Common part of device pairing.
+    """
+    dev_debug_id = remote_dev_config.get_debug_id()
+
+    # pair packet received from remote device
+    if received_pair_packet:
+        if received_pair_packet.body.pair:  # paired by remote device
+            remote_dev_config.paired = True
+            log.info(f'Device {dev_debug_id} paired.')
+            return True
+
+        elif not received_pair_packet.body.pair:  # unpaired by remote device
+            remote_dev_config.paired = False
+            log.info(f'Unpairing {dev_debug_id} done.')
+            return False
+
+    elif not remote_dev_config.paired:
+        pass
+
+
+async def send_unpair_request(remote_dev_config: RemoteDeviceConfig) -> bool:
+    """
+    Sends unpair request to the remote device.
+    """
+    if (
+        not remote_dev_config.paired
+        or not remote_dev_config.connected
+        or not remote_dev_config.connection_tls_socket
+    ):
+        return False
+
+    await remote_dev_config.connection_tls_socket.send(
+        PairPacket.generate(pair=False).prepare_to_send()
+    )
+
+    return True
+
+
+async def handle_device_disconnection(
+    remote_dev_config: RemoteDeviceConfig,
+    anysock: Union[SocketStream, TLSStream],
+    dev_debug_id: str,
+):
+    """
+    Device disconnection - the common code.
+    """
+    try:
+        await anysock.aclose()
+    except Exception:
+        log.exception(
+            (
+                'Ignored exception while disconnecting '
+                f'{remote_dev_config.get_debug_id()}.'
+            )
+        )
+
+    remote_dev_config.on_disconnect()

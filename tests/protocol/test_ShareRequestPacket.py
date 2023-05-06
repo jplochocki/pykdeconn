@@ -3,7 +3,7 @@ import datetime
 
 import pytest  # noqa
 
-from pykdeconn.protocol import ShareRequestPacket, generate_ShareRequestPacket
+from pykdeconn.protocol import ShareRequestPacket
 
 
 share_packet_example = (
@@ -25,9 +25,9 @@ def test_ShareRequestPacket_expected_values():
     assert shp.payloadTransferInfo.port == 1739
 
 
-def test_generate_ShareRequestPacket():
+def test_ShareRequestPacket_generate():
     # only (existing) file path
-    shp = generate_ShareRequestPacket(share_packet_example)
+    shp = ShareRequestPacket.generate(share_packet_example)
 
     assert type(shp) is ShareRequestPacket
     assert shp.type == 'kdeconnect.share.request'
@@ -41,7 +41,7 @@ def test_generate_ShareRequestPacket():
 
     # not existing file path
     not_existing_path = Path('Lorem ipsum dolor')
-    shp = generate_ShareRequestPacket(not_existing_path)
+    shp = ShareRequestPacket.generate(not_existing_path)
 
     assert type(shp) is ShareRequestPacket
     assert shp.type == 'kdeconnect.share.request'
@@ -51,7 +51,7 @@ def test_generate_ShareRequestPacket():
 
     # own last_modified param
     dt = datetime.datetime.now()
-    shp = generate_ShareRequestPacket(not_existing_path, last_modified=dt)
+    shp = ShareRequestPacket.generate(not_existing_path, last_modified=dt)
 
     assert type(shp) is ShareRequestPacket
     assert shp.type == 'kdeconnect.share.request'

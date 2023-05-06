@@ -15,7 +15,7 @@ from pykdeconn.gsconnect import (
     generate_identity_params,
 )
 from pykdeconn.settings import DeviceConfig
-from pykdeconn.protocol import IdentityPacket, generate_IdentityPacket
+from pykdeconn.protocol import IdentityPacket
 
 
 dconf_result_example = (
@@ -173,7 +173,7 @@ async def test_generate_identity_params(mocker):
     assert result['device_name'] == 'systemik-dell'
 
     # generate id packet test
-    id_pack = generate_IdentityPacket(**result)
+    id_pack = IdentityPacket.generate(**result)
 
     assert isinstance(id_pack, IdentityPacket)
     assert id_pack.body.deviceId == '00392cd2-329e-4ad6-9766-019a304b32f9'

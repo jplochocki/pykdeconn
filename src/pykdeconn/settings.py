@@ -23,7 +23,7 @@ from pydantic import (
 
 # from anyio.streams.tls import TLSStream
 
-from .protocol.packets import IdentityPacket, generate_IdentityPacket
+from .protocol.packets import IdentityPacket
 from .utils import running_in_pytest
 
 # from .sslutils import generate_cert, read_cert_common_name
@@ -369,7 +369,7 @@ def generate_my_identity() -> IdentityPacket:
     """
     Generates ID packet for this device.
     """
-    return generate_IdentityPacket(
+    return IdentityPacket.generate(
         device_id=config.device_id,
         device_name=config.device_name,
         incoming_capabilities=config.incoming_capabilities,

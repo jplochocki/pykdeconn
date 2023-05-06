@@ -6,7 +6,6 @@ from pydantic import ValidationError
 
 from pykdeconn.protocol import (
     IdentityPacket,
-    generate_IdentityPacket,
     KDE_CONNECT_PROTOCOL_VERSION,
     KDE_CONNECT_DEFAULT_PORT,
 )
@@ -52,8 +51,8 @@ def test_IdentityPacket_invalid_packet_type():
     )
 
 
-def test_generate_IdentityPacket():
-    idp = generate_IdentityPacket(
+def test_IdentityPacket_generate():
+    idp = IdentityPacket.generate(
         device_id='lorem.ipsum.dolor',
         device_name='lorem.ipsum.dolor device',
         device_type='desktop',
@@ -80,10 +79,17 @@ def test_generate_IdentityPacket():
 
     # empty device_id test
     with pytest.raises(ValidationError):
-        idp = generate_IdentityPacket(
+        idp = IdentityPacket.generate(
             device_id='',
             device_name='lorem.ipsum.dolor device',
             device_type='desktop',
             incoming_capabilities=['lorem.ipsum.dolor1', 'lorem.ipsum.dolor2'],
             outgoing_capabilities=['lorem.ipsum.dolor3', 'lorem.ipsum.dolor4'],
         )
+
+
+def test_IdentityPacket_prepare_to_send():
+    idp = IdentityPacket.parse_file(id_packet_example)
+    assert idp.prepare_to_send() == (
+        json.dumps(json.loads(id_packet_example.read_text())) + '\n'
+    ).encode('utf-8')
