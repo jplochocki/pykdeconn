@@ -114,6 +114,7 @@ class IdentityPacketBody(BaseModel):
         incoming_capabilities: List[str] = [],
         outgoing_capabilities: List[str] = [],
         tcp_port: int = KDE_CONNECT_DEFAULT_PORT,
+        **kwargs,
     ):
         """
         Generates a IdentityPacket instance.
@@ -154,7 +155,7 @@ class PairPacketBody(BaseModel):
     pair: bool
 
     @classmethod
-    def generate(cls, pair: bool):
+    def generate(cls, pair: bool, **kwargs):
         """
         Generates a PairPacket instance.
         """
@@ -212,6 +213,7 @@ class ShareRequestPacketBody(BaseModel):
         number_of_files: int = 1,
         total_size: Optional[int] = None,
         transfer_port: int = KDE_CONNECT_TRANSFER_PORT_MIN,
+        **kwargs,
     ):
         if file_size is None and file_path.exists():
             file_size = file_path.lstat().st_size

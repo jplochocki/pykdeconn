@@ -1,13 +1,13 @@
 from typing import Optional, Any, Dict, Tuple
 import datetime
 import ssl
-from pathlib import Path
 
 from pydantic import BaseModel, Field, PrivateAttr, IPvAnyAddress, PastDate
 from anyio import create_memory_object_stream
 
 from .consts import KDE_CONNECT_DEFAULT_PORT
 from .packets import KDEConnectPacket
+from .hostconfig import HostConfig
 
 
 class RemoteDeviceConfig(BaseModel):
@@ -20,6 +20,8 @@ class RemoteDeviceConfig(BaseModel):
     It contains the data necessary for the ``pykdeconn.protocol.connection``
     module to handle the connection.
     """
+
+    host_config: Optional[HostConfig] = None
 
     device_id: str
     device_name: str
@@ -42,8 +44,12 @@ class RemoteDeviceConfig(BaseModel):
     connection_tls_socket: Optional[Any] = None  # TLSStream
 
     @classmethod
-    def initialize(cls, config_base: Dict, remote_ip, remote_port):
-        a = cls.parse_obj(config_base)
+    def initialize(
+        cls, config_base: Dict, host_config: HostConfig, remote_ip, remote_port
+    ):
+        a = cls(**config_base)
+
+        a.host_config = host_config
         a.last_ip = remote_ip
         a.remote_port = remote_port
 
@@ -80,19 +86,21 @@ class RemoteDeviceConfig(BaseModel):
     def ssl_context(
         self,
         purpose: ssl.Purpose = ssl.Purpose.CLIENT_AUTH,
-        my_device_certfile: Optional[Path] = None,
-        my_device_keyfile: Optional[Path] = None,
         renew: bool = False,
     ) -> ssl.SSLContext:
         """
         Loads ``SSLContext`` for the specified ``purpose``.
         """
-        if not renew and purpose.shortname in self._ssl_cnx_cache:
+        if renew:
+            self._ssl_cnx_cache = {}
+
+        if purpose.shortname in self._ssl_cnx_cache:
             return self._ssl_cnx_cache[purpose.shortname]
 
         cnx = ssl.create_default_context(purpose)
         cnx.load_cert_chain(
-            certfile=my_device_certfile, keyfile=my_device_keyfile
+            certfile=self.host_config.device_certfile,
+            keyfile=self.host_config.device_keyfile,
         )
 
         cnx.check_hostname = False

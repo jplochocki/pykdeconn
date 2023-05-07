@@ -14,11 +14,15 @@ from .packets import (
     make_pack_mutable,
 )
 from .deviceconfig import RemoteDeviceConfig
+from .hostconfig import HostConfig
 from .connection import (
     KDEConnectPortBusy,
+    send_host_id_packets_task,
     wait_for_incoming_ids_task,
     outgoing_connection_task,
+    incoming_connection_task,
 )
+from .transfer import download
 
 
 __all__ = (
@@ -31,7 +35,11 @@ __all__ = (
     'PairPacket',
     'ShareRequestPacket',
     'RemoteDeviceConfig',
+    'HostConfig',
     'KDEConnectPortBusy',
+    'send_host_id_packets_task',
     'wait_for_incoming_ids_task',
     'outgoing_connection_task',
+    'incoming_connection_task',
+    'download',
 )
