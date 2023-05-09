@@ -24,6 +24,7 @@ from .protocol import (
     outgoing_connection_task,
     incoming_connection_task,
     download,
+    upload,
 )
 from .gsconnect import (
     generate_identity_params as gsconnect_identity_params,
@@ -124,6 +125,8 @@ async def handle_incoming_id_packs_task(
 
         # handle incoming packs
         main_group.start_soon(handle_packets_task, remote_dev_config)
+
+        await upload(remote_dev_config, Path('~/Foto_1440.jpg').expanduser())
 
 
 # handle incoming packs

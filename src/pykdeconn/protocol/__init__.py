@@ -22,7 +22,7 @@ from .connection import (
     outgoing_connection_task,
     incoming_connection_task,
 )
-from .transfer import download
+from .transfer import download, upload
 
 
 __all__ = (
@@ -42,4 +42,5 @@ __all__ = (
     'outgoing_connection_task',
     'incoming_connection_task',
     'download',
+    'upload',
 )

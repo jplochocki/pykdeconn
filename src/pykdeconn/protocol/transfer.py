@@ -2,14 +2,28 @@ import os
 import time
 import ssl
 import logging
+import errno
+import datetime
 from pathlib import Path
 from typing import Optional, Union, Callable, BinaryIO
 from asyncio import iscoroutinefunction
 
-
-from anyio import connect_tcp, open_file, wrap_file, Event
+from anyio import (
+    sleep,
+    connect_tcp,
+    create_tcp_listener,
+    open_file,
+    wrap_file,
+    Event,
+    ClosedResourceError,
+)
 from anyio.abc import SocketAttribute
+from anyio.streams.tls import TLSListener
 
+from .consts import (
+    KDE_CONNECT_TRANSFER_PORT_MIN,
+    KDE_CONNECT_TRANSFER_PORT_MAX,
+)
 from .packets import ShareRequestPacket
 from .deviceconfig import RemoteDeviceConfig
 
@@ -74,9 +88,11 @@ async def download(
                     progress_cb(*progress_args)
                 else:
                     # log after +20% or next 3 seconds
-                    if (time.time() - last_log_time) >= 3 or (
-                        percent - last_log_percent
-                    ) > 20:
+                    if (
+                        (time.time() - last_log_time) >= 3
+                        or (percent - last_log_percent) > 20
+                        or percent == 100.0
+                    ):
                         log.debug(
                             (
                                 f'Downloading {dest_file.name}: {received} of '
@@ -105,6 +121,7 @@ async def upload(
         file_size = Path(source_file).stat().st_size
         file_name = Path(source_file).name
         file_stream = await open_file(source_file, 'rb')
+        last_modified = int(source_file.lstat().st_mtime)
     else:
         file_stream = wrap_file(source_file)
 
@@ -114,16 +131,121 @@ async def upload(
 
         # always set name in stream
         file_name = getattr(file_stream, 'name', '')
+        last_modified = int(
+            datetime.datetime.timestamp(datetime.datetime.now())
+        )
 
     # start upload server
-    server = None
-    close_server_event = Event()
+    upload_server = None
+    server_shutdown_event = Event()
 
-    async def handle_connection(sock_client):
-        async with sock_client:
-            remote_ip, remote_port = sock_client.extra(
+    async def handle_connection(client_socket):
+        async with client_socket:
+            remote_ip, remote_port = client_socket.extra(
                 SocketAttribute.remote_address
             )
             log.info(
                 f'Upload file {file_name} - device connected ({remote_ip}).'
             )
+
+            if progress_cb and iscoroutinefunction(progress_cb):
+                await progress_cb(source_file, file_size, 0, 0.0)
+            elif progress_cb:
+                progress_cb(source_file, file_size, 0, 0.0)
+
+            async with file_stream as f:
+                sent = 0
+                last_log_time = time.time()
+                last_log_percent = 0
+
+                while sent < file_size:
+                    data = await f.read(63 * 1024)
+                    await client_socket.send(data)
+
+                    sent += len(data)
+
+                    percent = float(sent) / float(file_size) * 100.0
+                    progress_args = (
+                        source_file,
+                        file_size,
+                        sent,
+                        percent,
+                    )
+                    if progress_cb and iscoroutinefunction(progress_cb):
+                        await progress_cb(*progress_args)
+                    elif progress_cb:
+                        progress_cb(*progress_args)
+                    else:
+                        # log after +20% or next 3 seconds
+                        if (
+                            (time.time() - last_log_time) >= 3
+                            or (percent - last_log_percent) > 20
+                            or percent == 100.0
+                        ):
+                            log.debug(
+                                (
+                                    f'Uploading {file_name}: sent {sent} of '
+                                    f'{file_size} ({percent:.1f}%)'
+                                )
+                            )
+                            last_log_time = time.time()
+                            last_log_percent = percent
+
+        await upload_server.aclose()
+        server_shutdown_event.set()
+
+    # checking the first available upload port
+    transfer_port = 0
+    for port in range(
+        KDE_CONNECT_TRANSFER_PORT_MIN, KDE_CONNECT_TRANSFER_PORT_MAX + 1
+    ):
+        try:
+            upload_server = TLSListener(
+                await create_tcp_listener(
+                    local_port=port, local_host='0.0.0.0'
+                ),
+                ssl_context=remote_dev_config.ssl_context(
+                    ssl.Purpose.CLIENT_AUTH
+                ),
+                standard_compatible=False,
+            )
+            log.debug(f'Selected port {port} for file upload.')
+            transfer_port = port
+
+            break
+        except OSError as e:
+            if e.errno == errno.EADDRINUSE:  # port already in use - ignore
+                continue
+            raise e
+
+    # send share request packet
+    total_files_size = (
+        total_files_size
+        if total_files_size != -1 and total_files_size > file_size
+        else file_size
+    )
+
+    share_pack = ShareRequestPacket.generate(
+        file_path=Path(file_name),
+        file_size=file_size,
+        last_modified=last_modified,
+        number_of_files=number_of_files,
+        total_size=total_files_size,
+        transfer_port=transfer_port,
+    )
+
+    serve_forever = upload_server.serve(handle_connection)
+    await sleep(0.01)
+
+    await remote_dev_config.connection_tls_socket.send(
+        share_pack.prepare_to_send()
+    )
+    log.info('Upload packet sent.')
+
+    try:
+        await serve_forever
+    except ClosedResourceError:
+        server_shutdown_event.set()
+
+    await server_shutdown_event.wait()
+    log.debug('Transfer server closed.')
