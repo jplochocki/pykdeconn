@@ -1,32 +1,20 @@
 import re
-from typing import Optional, Any, List, Tuple, Dict, Literal, ClassVar
-import datetime
+import asyncio
 import logging
 import logging.config
-import socket
-from pathlib import Path
 import json
 import sys
 import uuid
-import ssl
+import time
+from typing import Any, List, Tuple, Dict, Literal
+from pathlib import Path
 
-from pydantic import (
-    BaseModel,
-    BaseSettings,
-    Field,
-    validator,
-    PydanticValueError,
-    IPvAnyAddress,
-    PastDate,
-    PrivateAttr,
-)
+from pydantic import BaseSettings, Field, validator
+from anyio.from_thread import run as run_async  # noqa
 
-# from anyio.streams.tls import TLSStream
-
-from .protocol.packets import IdentityPacket
+from .protocol import BaseDeviceConfig, BaseHostConfig, IdentityPacket
 from .utils import running_in_pytest
-
-# from .sslutils import generate_cert, read_cert_common_name
+from .sslutils import generate_cert, read_cert_common_name  # noqa
 
 
 logging.config.dictConfig(
@@ -59,109 +47,38 @@ logging.config.dictConfig(
 log = logging.getLogger('pykdeconn.server')
 
 
-class InvalidPEMFormatError(PydanticValueError):
-    code = 'invalid_PEM_format'
-    msg_template = 'Invalid PEM Certificate format'
-
-
-class DeviceConfig(BaseModel):
+class PyKDEConnDeviceConfig(BaseDeviceConfig):
     """
-    KDE Connect device information and config.
+    Specialized version of BaseDeviceConfig (e.g. save options).
     """
 
-    device_id: str
-    device_name: str
-
-    certificate_PEM: str = ''
-
-    @validator('certificate_PEM')
-    def cert_str_format_or_empty(cls, value: str) -> str:
-        if value == '':
-            return value
-
-        if not re.match(
-            (
-                r'^\s*-----BEGIN CERTIFICATE-----\n[A-Za-z0-9\+\/=\n]+\n'
-                r'-----END CERTIFICATE-----\s*$'
-            ),
-            value,
-        ):
-            raise InvalidPEMFormatError(pem_value=value)
-
-        return value
-
-    paired: bool = False
-    type_: str = 'phone'
-    last_ip: Optional[IPvAnyAddress] = None
-    last_connection_date: PastDate = Field(
-        default_factory=lambda: datetime.datetime.now()
-    )
-    _connected: bool = PrivateAttr(False)
-    _connection_ssock: Optional[Any] = PrivateAttr(None)  # TLSStream
-
-    incoming_capabilities: List[str] = []
-    outgoing_capabilities: List[str] = []
-
-    _devices_cache: ClassVar = {}
-
-    @classmethod
-    def load_from_id_packet(cls, pack: IdentityPacket):
-        """
-        Loads (or create) ``DeviceConfig`` from ``kdeconnect.identity`` packet.
-        """
-        if pack.body.deviceId in DeviceConfig._devices_cache:
-            return DeviceConfig._devices_cache[pack.body.deviceId]
-
-        dev = cls(
-            device_id=pack.body.deviceId,
-            device_name=pack.body.deviceName,
-        )
-        DeviceConfig._devices_cache[pack.body.deviceId] = dev
-
-        dev.incoming_capabilities = pack.body.incomingCapabilities.copy()
-        dev.outgoing_capabilities = pack.body.outgoingCapabilities.copy()
-
-        return dev
-
-    _ssl_cnx_cache: Dict[str, Any] = PrivateAttr(default_factory=dict)
-
-    def ssl_context(
-        self,
-        purpose: ssl.Purpose = ssl.Purpose.CLIENT_AUTH,
-        my_device_certfile: Optional[Path] = None,
-        my_device_keyfile: Optional[Path] = None,
-        renew: bool = False,
-    ) -> ssl.SSLContext:
-        """
-        Loads ``SSLContext`` for the specified ``purpose``.
-        """
-        if not renew and purpose.shortname in self._ssl_cnx_cache:
-            return self._ssl_cnx_cache[purpose.shortname]
-
-        cnx = ssl.create_default_context(purpose)
-        cnx.load_cert_chain(
-            certfile=my_device_certfile, keyfile=my_device_keyfile
-        )
-
-        cnx.check_hostname = False
-        cnx.verify_mode = ssl.CERT_NONE
-
-        if self.certificate_PEM:
-            cnx.load_verify_locations(
-                cadata=ssl.PEM_cert_to_DER_cert(self.certificate_PEM)
-            )
-            cnx.verify_mode = ssl.CERT_REQUIRED
-
-        self._ssl_cnx_cache[purpose.shortname] = cnx
-        return cnx
+    def __setattr__(self, name, value):
+        super().__setattr__(name, value)
+        if self.host_config and name in self.__config__._fields_to_save:
+            self.save()
 
     def save(self):
-        pass
+        if self.host_config and hasattr(self.host_config, 'save'):
+            self.host_config.save()
+
+    class Config:
+        orm_mode = True
+        _fields_to_save = {
+            'device_id',
+            'device_name',
+            'certificate_PEM',
+            'type_',
+            'incoming_capabilities',
+            'outgoing_capabilities',
+            'last_ip',
+            'last_connection_date',
+            'paired',
+        }
 
 
 class PyKDEConnSettingsSourceDir(BaseSettings):
     """
-    Settings directory (default or from environmet variables).
+    Settings directory source (default or from environmet variables).
     """
 
     config_dir: Path = Field(
@@ -173,8 +90,8 @@ class PyKDEConnSettingsSourceDir(BaseSettings):
     def config_dir_default_factory() -> Path:
         """
         Creates config directory path (``~/.config/pykdeconn`` if ``~/.config``
-        exists or ``~/.pykdeconn`` else). If we're running in pytest
-        environment - return tests/config path.
+        exists or ``~/.pykdeconn`` else). If we're running in ``pytest``
+        environment - returns ``tests/config`` path.
         """
         if running_in_pytest():
             # We are trying to determine the path to the tests/ directory.
@@ -184,6 +101,13 @@ class PyKDEConnSettingsSourceDir(BaseSettings):
             tests_dir = (Path('.') / tests_dir).resolve()
             if tests_dir.exists():
                 return tests_dir / 'config'
+            else:
+                log.warning(
+                    (
+                        'Config directory to run in pytest does not exists '
+                        f'({tests_dir})'
+                    )
+                )
 
         if Path('~/.config').expanduser().exists():
             return Path('~/.config/pykdeconn').expanduser()
@@ -192,6 +116,9 @@ class PyKDEConnSettingsSourceDir(BaseSettings):
 
     @validator('config_dir')
     def create_dir_if_not_exists(cls, p: Path) -> Path:
+        """
+        Creates a configuration directory if it does not exists.
+        """
         if not p.exists():
             p.mkdir(parents=True, exist_ok=True)
         elif not p.is_dir:
@@ -214,7 +141,7 @@ def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
         return {}
 
 
-class PyKDEConnSettings(BaseSettings):
+class PyKDEConnSettings(BaseHostConfig):
     log_level: Literal[
         logging.CRITICAL,
         logging.ERROR,
@@ -229,7 +156,10 @@ class PyKDEConnSettings(BaseSettings):
     ] = logging.DEBUG
 
     @validator('log_level', always=True)
-    def log_level_set(cls, v):
+    def parse_log_level(cls, v):
+        """
+        Parses and validates log_level value.
+        """
         named_lvls = {
             'CRITICAL': logging.CRITICAL,
             'ERROR': logging.ERROR,
@@ -238,18 +168,9 @@ class PyKDEConnSettings(BaseSettings):
             'DEBUG': logging.DEBUG,
         }
 
-        if (
-            v
-            not in [
-                logging.CRITICAL,
-                logging.ERROR,
-                logging.WARNING,
-                logging.INFO,
-                logging.DEBUG,
-            ]
-            and v not in named_lvls.keys()
-        ):
+        if v not in named_lvls.values() and v not in named_lvls.keys():
             raise ValueError(f'Invalid log_level value ({v}).')
+
         if v in named_lvls.keys():
             log.setLevel(named_lvls[v])
             return v
@@ -257,72 +178,159 @@ class PyKDEConnSettings(BaseSettings):
             log.setLevel(v)
             return [k for k, a in named_lvls.items() if a == v][0]
 
-    device_name: str = Field(default_factory=socket.gethostname)
-    device_id: str = ''
-
     @validator('device_id', always=True)
     def device_id_gen_or_read(cls, v, values) -> str:
         """
-        Reads device_id from the certificate file (if any) or generates one.
+        Reads device_id from the certificate file (if it exists)
+        or generates a new unique ID
         """
         (
             device_certfile,
             _,
-        ) = PyKDEConnSettings.gen_cert_files_paths(values['device_name'])
+        ) = PyKDEConnSettings.gen_cert_files_paths()
         if device_certfile.exists():
-            # return read_cert_common_name(device_certfile)
-            return ''
-        else:
-            return uuid.uuid4().urn.replace('urn:uuid:', '')
+            return asyncio.get_event_loop().run_until_complete(
+                read_cert_common_name(device_certfile)
+            )
+        return uuid.uuid4().urn.replace('urn:uuid:', '')
 
-    device_type: str = 'laptop'
-    incoming_capabilities: List[str] = []
-    outgoing_capabilities: List[str] = []
+    @validator('incoming_capabilities')
+    def incoming_capabilities_defaults(cls, v) -> List:
+        if not v:
+            return ['kdeconnect.share.request']
 
-    device_certfile: Optional[Path] = None
-    device_keyfile: Optional[Path] = None
+        return v
+
+    @validator('outgoing_capabilities')
+    def outgoing_capabilities_defaults(cls, v) -> List:
+        if not v:
+            return ['kdeconnect.share.request']
+
+        return v
 
     @validator('device_certfile', always=True)
     def device_certfile_gen_path(cls, v, values):
-        if isinstance(v, Path):
-            return v.resolve()
-        else:
-            return PyKDEConnSettings.gen_cert_files_paths(
-                values['device_name']
-            )[0]
+        if isinstance(v, Path) and not v.is_absolute():
+            return config_source_dir.config_dir / v
+        elif isinstance(v, Path):
+            return v
+
+        return PyKDEConnSettings.gen_cert_files_paths()[0]
 
     @validator('device_keyfile', always=True)
     def device_keyfile_gen_path_and_cert(cls, v, values):
         device_keyfile = v
         device_certfile = values['device_certfile']
+
         if not isinstance(device_keyfile, Path):
             (
                 device_certfile,
                 device_keyfile,
-            ) = PyKDEConnSettings.gen_cert_files_paths(values['device_name'])
+            ) = PyKDEConnSettings.gen_cert_files_paths()
+
+        if not device_keyfile.is_absolute():
+            device_keyfile = device_certfile.parent / device_keyfile
 
         # create certs files if don't exists
         if not device_keyfile.exists() or not device_certfile.exists():
-            # generate_cert(
-            #     values['device_name'],
-            #     values['device_id'],
-            #     device_certfile,
-            #     device_keyfile,
-            # )
-            pass
+            asyncio.get_event_loop().run_until_complete(
+                generate_cert(
+                    values['device_id'],
+                    device_certfile,
+                    device_keyfile,
+                )
+            )
 
         return device_keyfile.resolve()
 
     @staticmethod
-    def gen_cert_files_paths(device_name) -> Tuple[Path, Path]:
+    def gen_cert_files_paths(device_name: str = '') -> Tuple[Path, Path]:
         """
         Generates paths to a certificate files pair.
         """
-        dev_name = re.sub(r'[^a-z0-9\-]', '', device_name.lower())
+        if device_name:
+            device_name = '-' + re.sub(r'[^a-z0-9\-]', '', device_name.lower())
         return (
-            config_source_dir.config_dir / f'certificate-{dev_name}.pem',
-            config_source_dir.config_dir / f'private-{dev_name}.pem',
+            config_source_dir.config_dir / f'certificate{device_name}.pem',
+            config_source_dir.config_dir / f'private{device_name}.pem',
         )
+
+    ignore_device_ids: list = []
+
+    @validator('ignore_device_ids', always=True)
+    def ignore_device_ids_default(cls, v, values):
+        """
+        Add yours device_id to ignored devices list
+        """
+        v.append(values['device_id'])
+        return v
+
+    recent_device_ids_list: List[Tuple[int, IdentityPacket]] = []
+
+    def update_recent_device_ids_list(self, id_pack: IdentityPacket):
+        now = int(time.time())
+
+        # add or update this id pack
+        already_known_idp_idx = next(
+            (
+                idx
+                for idx, (_, idp) in enumerate(self.recent_device_ids_list)
+                if idp.body.deviceId == id_pack.body.deviceId
+            ),
+            -1,
+        )
+        if self.device_id != id_pack.body.deviceId:
+            if already_known_idp_idx != -1:
+                # update receive time
+                self.recent_device_ids_list[already_known_idp_idx] = (
+                    now,
+                    id_pack,
+                )
+            else:
+                self.recent_device_ids_list.append((now, id_pack))
+
+        # remove old id packets
+        past_60_secs = now - 60
+        self.recent_device_ids_list = [
+            (tm, idp)
+            for tm, idp in self.recent_device_ids_list
+            if tm >= past_60_secs
+        ]
+
+    devices: Dict[str, PyKDEConnDeviceConfig] = {}
+
+    def get_or_create_device_config(
+        self,
+        remote_id_pack: IdentityPacket,
+        remote_ip,
+        must_be_paired: bool = False
+    ) -> BaseDeviceConfig:
+        """
+        Loads (or create) ``PyKDEConnDeviceConfig`` from
+        ``kdeconnect.identity`` packet.
+        """
+        if remote_id_pack.body.deviceId in self.devices:
+            dev = self.devices[remote_id_pack.body.deviceId]
+            if must_be_paired and not dev.paired:
+                return None
+            return self.devices[remote_id_pack.body.deviceId]
+
+        if must_be_paired:
+            return None
+
+        dev = PyKDEConnDeviceConfig(
+            device_id=remote_id_pack.body.deviceId,
+            device_name=remote_id_pack.body.deviceName,
+            host_config=self,
+            last_ip=remote_ip,
+            remote_port=remote_id_pack.body.tcpPort,
+            incoming_capabilities=remote_id_pack.body.incomingCapabilities.copy(),  # noqa
+            outgoing_capabilities=remote_id_pack.body.outgoingCapabilities.copy(),  # noqa
+        )
+
+        self.devices[remote_id_pack.body.deviceId] = dev
+        self.save()
+        return dev
 
     def save(self):
         """
@@ -331,7 +339,7 @@ class PyKDEConnSettings(BaseSettings):
         encoding = self.__config__.env_file_encoding
 
         # save cert paths as relative
-        a = self.dict()
+        a = self.dict(include=self.__config__._fields_to_save)
         a['device_certfile'] = str(
             self.device_certfile.relative_to(config_file.parent)
         )
@@ -344,6 +352,17 @@ class PyKDEConnSettings(BaseSettings):
     class Config:
         env_prefix = 'PYKDECONN_'
         env_file_encoding = 'utf-8'
+        _fields_to_save = {
+            'log_level',
+            'device_name',
+            'device_id',
+            'device_type',
+            'incoming_capabilities',
+            'outgoing_capabilities',
+            'device_certfile',
+            'device_keyfile',
+            'devices',
+        }
 
         @classmethod
         def customise_sources(
@@ -360,18 +379,6 @@ class PyKDEConnSettings(BaseSettings):
             )
 
 
-config = PyKDEConnSettings()
+host_config = PyKDEConnSettings()
 if not config_file.exists():
-    config.save()
-
-
-def generate_my_identity() -> IdentityPacket:
-    """
-    Generates ID packet for this device.
-    """
-    return IdentityPacket.generate(
-        device_id=config.device_id,
-        device_name=config.device_name,
-        incoming_capabilities=config.incoming_capabilities,
-        outgoing_capabilities=config.outgoing_capabilities,
-    )
+    host_config.save()

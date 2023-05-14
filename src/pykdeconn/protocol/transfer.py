@@ -25,7 +25,7 @@ from .consts import (
     KDE_CONNECT_TRANSFER_PORT_MAX,
 )
 from .packets import ShareRequestPacket
-from .deviceconfig import RemoteDeviceConfig
+from .settings import BaseDeviceConfig
 
 
 log = logging.getLogger('pykdeconn.server')
@@ -37,7 +37,7 @@ ProgressCallbackT = Callable[
 
 
 async def download(
-    remote_dev_config: RemoteDeviceConfig,
+    remote_dev_config: BaseDeviceConfig,
     share_pack: ShareRequestPacket,
     dest_file: Union[str, Path, BinaryIO],
     progress_cb: Optional[ProgressCallbackT] = None,
@@ -108,7 +108,7 @@ async def download(
 
 
 async def upload(
-    remote_dev_config: RemoteDeviceConfig,
+    remote_dev_config: BaseDeviceConfig,
     source_file: Union[str, Path, BinaryIO],
     progress_cb: Optional[ProgressCallbackT] = None,
     number_of_files: int = 1,

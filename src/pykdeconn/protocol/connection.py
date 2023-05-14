@@ -27,8 +27,7 @@ from .packets import (
     PairPacket,
     get_packet_by_kde_type_name,
 )
-from .deviceconfig import RemoteDeviceConfig
-from .hostconfig import HostConfig
+from .settings import BaseDeviceConfig, BaseHostConfig
 
 log = logging.getLogger('pykdeconn.server')
 
@@ -37,7 +36,7 @@ class KDEConnectPortBusy(Exception):
     pass
 
 
-async def send_host_id_packets_task(host_config: HostConfig):
+async def send_host_id_packets_task(host_config: BaseHostConfig):
     """
     Sends host device ID packets (``kdeconnect.identity``) using
     ``UDP broadcast``.
@@ -104,7 +103,7 @@ async def wait_for_incoming_ids_task(
 
 
 async def outgoing_connection_task(
-    remote_dev_config: RemoteDeviceConfig,
+    remote_dev_config: BaseDeviceConfig,
     *,
     task_status: TaskStatus = TASK_STATUS_IGNORED,
 ):
@@ -184,9 +183,9 @@ async def outgoing_connection_task(
 
 
 async def incoming_connection_task(
-    host_config: HostConfig,
+    host_config: BaseHostConfig,
     new_incoming_connection_cb: Callable[
-        [IPvAnyAddress, IdentityPacket], Optional[RemoteDeviceConfig]
+        [IPvAnyAddress, IdentityPacket], Optional[BaseDeviceConfig]
     ],
     *,
     task_status: TaskStatus = TASK_STATUS_IGNORED,
@@ -195,7 +194,7 @@ async def incoming_connection_task(
     Handles incoming connection (with the device we've send ID to).
     """
 
-    async def handle_connection(client_socket):
+    async def handle_incoming_connection(client_socket):
         async with client_socket:
             host_config.could_send_my_id_packs = (
                 False  # block sending next ids
@@ -236,6 +235,11 @@ async def incoming_connection_task(
             if not remote_dev_config:  # False - ie. already connected device
                 host_config.could_send_my_id_packs = True
                 await client_socket.aclose()
+                return
+            if remote_dev_config.connected:
+                remote_dev_config.on_disconnect()
+                await client_socket.aclose()
+                host_config.could_send_my_id_packs = True
                 return
             dev_debug_id = remote_dev_config.get_debug_id()
 
@@ -318,7 +322,7 @@ async def incoming_connection_task(
         local_port=KDE_CONNECT_DEFAULT_PORT, local_host='0.0.0.0'
     )
     task_status.started()
-    await listener.serve(handle_connection)
+    await listener.serve(handle_incoming_connection)
 
 
 async def receive_packet(
@@ -362,7 +366,7 @@ async def receive_packet(
 
 
 async def handle_pairing(
-    remote_dev_config: RemoteDeviceConfig,
+    remote_dev_config: BaseDeviceConfig,
     received_pair_packet: PairPacket = None,
 ) -> bool:
     """
@@ -386,7 +390,7 @@ async def handle_pairing(
         pass
 
 
-async def send_unpair_request(remote_dev_config: RemoteDeviceConfig) -> bool:
+async def send_unpair_request(remote_dev_config: BaseDeviceConfig) -> bool:
     """
     Sends unpair request to the remote device.
     """
@@ -405,7 +409,7 @@ async def send_unpair_request(remote_dev_config: RemoteDeviceConfig) -> bool:
 
 
 async def handle_device_disconnection(
-    remote_dev_config: RemoteDeviceConfig,
+    remote_dev_config: BaseDeviceConfig,
 ):
     """
     Device disconnection - the common code.

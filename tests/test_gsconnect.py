@@ -14,7 +14,7 @@ from pykdeconn.gsconnect import (
     read_device_config,
     generate_identity_params,
 )
-from pykdeconn.settings import DeviceConfig
+from pykdeconn.settings import PyKDEConnDeviceConfig
 from pykdeconn.protocol import IdentityPacket
 
 
@@ -136,8 +136,8 @@ async def test_read_device_config(mocker):
     assert type(result['paired']) == bool and result['paired']
     assert result['type_'] == 'phone'
 
-    # known device convert to DeviceConfig
-    result = DeviceConfig.parse_obj(result)
+    # known device convert to PyKDEConnDeviceConfig
+    result = PyKDEConnDeviceConfig.parse_obj(result)
 
     assert result.device_id == '2fe54440ccaa5e3b'
     assert result.certificate_PEM.startswith('-----BEGIN CERTIFICATE-----')

@@ -13,8 +13,7 @@ from .packets import (
     get_packet_by_kde_type_name,
     make_pack_mutable,
 )
-from .deviceconfig import RemoteDeviceConfig
-from .hostconfig import HostConfig
+from .settings import BaseDeviceConfig, BaseHostConfig
 from .connection import (
     KDEConnectPortBusy,
     send_host_id_packets_task,
@@ -34,8 +33,8 @@ __all__ = (
     'IdentityPacket',
     'PairPacket',
     'ShareRequestPacket',
-    'RemoteDeviceConfig',
-    'HostConfig',
+    'BaseDeviceConfig',
+    'BaseHostConfig',
     'KDEConnectPortBusy',
     'send_host_id_packets_task',
     'wait_for_incoming_ids_task',
