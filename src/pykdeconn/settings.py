@@ -114,7 +114,7 @@ class PyKDEConnSettingsSourceDir(BaseSettings):
         else:
             return Path('~/.pykdeconn').expanduser()
 
-    @validator('config_dir')
+    @validator('config_dir', always=True)
     def create_dir_if_not_exists(cls, p: Path) -> Path:
         """
         Creates a configuration directory if it does not exists.
@@ -125,9 +125,25 @@ class PyKDEConnSettingsSourceDir(BaseSettings):
             raise ValueError('Path does not point to a directory.')
         return p
 
+    config_file: Path = Field('config.json', env='PYKDECONN_CONFIG_FILE')
 
-config_source_dir = PyKDEConnSettingsSourceDir()
-config_file = config_source_dir.config_dir / 'config.json'
+    @validator('config_file', always=True)
+    def make_path_absolute(cls, v: Path, values, field) -> Path:
+        """
+        Makes the config_file path absoulte path.
+
+
+        If you set path via the PYKDECONN_CONFIG_FILE variable, always use
+        absolute path (otherwise it will be considered relative
+        to the config_dir directory).
+        """
+        if not v.is_absolute():
+            return values['config_dir'] / field.default
+
+        return v
+
+
+config_source = PyKDEConnSettingsSourceDir()
 
 
 def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
@@ -135,10 +151,12 @@ def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
     Read settings from JSON file.
     """
     encoding = settings.__config__.env_file_encoding
-    if config_file.exists():
-        return json.loads(config_file.read_text(encoding))
-    else:
-        return {}
+    if config_source.config_file.exists():
+        a = config_source.config_file.read_text(encoding)
+        if a:
+            return json.loads(a)
+
+    return {}
 
 
 class PyKDEConnSettings(BaseHostConfig):
@@ -184,6 +202,9 @@ class PyKDEConnSettings(BaseHostConfig):
         Reads device_id from the certificate file (if it exists)
         or generates a new unique ID
         """
+        if v:
+            return v
+
         (
             device_certfile,
             _,
@@ -194,24 +215,24 @@ class PyKDEConnSettings(BaseHostConfig):
             )
         return uuid.uuid4().urn.replace('urn:uuid:', '')
 
-    @validator('incoming_capabilities')
+    @validator('incoming_capabilities', always=True)
     def incoming_capabilities_defaults(cls, v) -> List:
-        if not v:
-            return ['kdeconnect.share.request']
+        if v:
+            return v
 
-        return v
+        return ['kdeconnect.share.request']
 
-    @validator('outgoing_capabilities')
+    @validator('outgoing_capabilities', always=True)
     def outgoing_capabilities_defaults(cls, v) -> List:
-        if not v:
-            return ['kdeconnect.share.request']
+        if v:
+            return v
 
-        return v
+        return ['kdeconnect.share.request']
 
     @validator('device_certfile', always=True)
     def device_certfile_gen_path(cls, v, values):
         if isinstance(v, Path) and not v.is_absolute():
-            return config_source_dir.config_dir / v
+            return config_source.config_file.parent / v
         elif isinstance(v, Path):
             return v
 
@@ -229,7 +250,12 @@ class PyKDEConnSettings(BaseHostConfig):
             ) = PyKDEConnSettings.gen_cert_files_paths()
 
         if not device_keyfile.is_absolute():
-            device_keyfile = device_certfile.parent / device_keyfile
+            device_keyfile = config_source.config_file.parent / device_keyfile
+
+        if not device_certfile.is_absolute():
+            device_certfile = (
+                config_source.config_file.parent / device_certfile
+            )
 
         # create certs files if don't exists
         if not device_keyfile.exists() or not device_certfile.exists():
@@ -251,8 +277,8 @@ class PyKDEConnSettings(BaseHostConfig):
         if device_name:
             device_name = '-' + re.sub(r'[^a-z0-9\-]', '', device_name.lower())
         return (
-            config_source_dir.config_dir / f'certificate{device_name}.pem',
-            config_source_dir.config_dir / f'private{device_name}.pem',
+            config_source.config_file.parent / f'certificate{device_name}.pem',
+            config_source.config_file.parent / f'private{device_name}.pem',
         )
 
     ignore_device_ids: list = []
@@ -303,7 +329,7 @@ class PyKDEConnSettings(BaseHostConfig):
         self,
         remote_id_pack: IdentityPacket,
         remote_ip,
-        must_be_paired: bool = False
+        must_be_paired: bool = False,
     ) -> BaseDeviceConfig:
         """
         Loads (or create) ``PyKDEConnDeviceConfig`` from
@@ -313,7 +339,7 @@ class PyKDEConnSettings(BaseHostConfig):
             dev = self.devices[remote_id_pack.body.deviceId]
             if must_be_paired and not dev.paired:
                 return None
-            return self.devices[remote_id_pack.body.deviceId]
+            return dev
 
         if must_be_paired:
             return None
@@ -340,14 +366,33 @@ class PyKDEConnSettings(BaseHostConfig):
 
         # save cert paths as relative
         a = self.dict(include=self.__config__._fields_to_save)
-        a['device_certfile'] = str(
-            self.device_certfile.relative_to(config_file.parent)
-        )
-        a['device_keyfile'] = str(
-            self.device_keyfile.relative_to(config_file.parent)
-        )
 
-        config_file.write_text(json.dumps(a, indent=4), encoding=encoding)
+        try:
+            a['device_certfile'] = str(
+                self.device_certfile.relative_to(
+                    config_source.config_file.parent
+                )
+            )
+            a['device_keyfile'] = str(
+                self.device_keyfile.relative_to(
+                    config_source.config_file.parent
+                )
+            )
+        except ValueError:
+            a['device_certfile'] = str(self.device_certfile)
+            a['device_keyfile'] = str(self.device_keyfile)
+
+        # save devices
+        a['devices'] = {
+            dev_id: json.loads(
+                dev.json(include=dev.__config__._fields_to_save)
+            )
+            for dev_id, dev in self.devices.items()
+        }
+
+        config_source.config_file.write_text(
+            json.dumps(a, indent=4), encoding=encoding
+        )
 
     class Config:
         env_prefix = 'PYKDECONN_'
@@ -361,7 +406,6 @@ class PyKDEConnSettings(BaseHostConfig):
             'outgoing_capabilities',
             'device_certfile',
             'device_keyfile',
-            'devices',
         }
 
         @classmethod
@@ -380,5 +424,5 @@ class PyKDEConnSettings(BaseHostConfig):
 
 
 host_config = PyKDEConnSettings()
-if not config_file.exists():
+if not config_source.config_file.exists():
     host_config.save()

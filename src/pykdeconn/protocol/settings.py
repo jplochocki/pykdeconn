@@ -13,7 +13,6 @@ from pydantic import (
     PrivateAttr,
     validator,
     IPvAnyAddress,
-    PastDate,
     PydanticValueError,
 )
 from anyio import create_memory_object_stream
@@ -59,9 +58,17 @@ class BaseHostConfig(BaseSettings):
         """
         Generates ID packet for this device.
         """
-        return IdentityPacket.generate(**self.dict(include={
-            'device_id', 'device_name', 'device_type', 'incoming_capabilities',
-            'outgoing_capabilities'}))
+        return IdentityPacket.generate(
+            **self.dict(
+                include={
+                    'device_id',
+                    'device_name',
+                    'device_type',
+                    'incoming_capabilities',
+                    'outgoing_capabilities',
+                }
+            )
+        )
 
 
 class BaseDeviceConfig(BaseModel):
@@ -100,7 +107,7 @@ class BaseDeviceConfig(BaseModel):
     last_ip: Optional[IPvAnyAddress] = None
     remote_port: int = KDE_CONNECT_DEFAULT_PORT
 
-    last_connection_date: PastDate = Field(
+    last_connection_date: datetime.datetime = Field(
         default_factory=lambda: datetime.datetime.now()
     )
 
