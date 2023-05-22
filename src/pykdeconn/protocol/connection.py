@@ -64,6 +64,7 @@ async def wait_for_incoming_ids_task(
     new_id_sender: MemoryObjectSendStream[
         Tuple[IPvAnyAddress, IdentityPacket]
     ],
+    ignore_my_device_id: str = '',
 ):
     """
     Listens on ``UDP Broadcast`` for incoming device ID packets.
@@ -87,12 +88,16 @@ async def wait_for_incoming_ids_task(
                     )
                     continue
 
-                log.debug(
-                    (
-                        f'Id packet received: {pack.body.deviceName} / '
-                        f'{pack.body.deviceId} (IP: {remote_ip})'
+                if (
+                    ignore_my_device_id == ''
+                    or pack.body.deviceId != ignore_my_device_id
+                ):
+                    log.debug(
+                        (
+                            f'Id packet received: {pack.body.deviceName} / '
+                            f'{pack.body.deviceId} (IP: {remote_ip})'
+                        )
                     )
-                )
 
                 await new_id_sender.send((remote_ip, pack))
     except OSError as e:
@@ -387,7 +392,10 @@ async def handle_pairing(
             return False
 
     elif not remote_dev_config.paired:
+        # receive pair packet
         pass
+
+    return False
 
 
 async def send_unpair_request(remote_dev_config: BaseDeviceConfig) -> bool:

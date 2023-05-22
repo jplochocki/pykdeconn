@@ -35,7 +35,9 @@ async def server_main():
         # receiving new ids
         try:
             main_group.start_soon(
-                wait_for_incoming_ids_task, host_config.new_id_sender
+                wait_for_incoming_ids_task,
+                host_config.new_id_sender,
+                host_config.device_id,
             )
         except KDEConnectPortBusy:
             log.exception(

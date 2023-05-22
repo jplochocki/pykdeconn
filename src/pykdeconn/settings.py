@@ -152,9 +152,9 @@ def json_config_settings_source(settings: BaseSettings) -> Dict[str, Any]:
     """
     encoding = settings.__config__.env_file_encoding
     if config_source.config_file.exists():
-        a = config_source.config_file.read_text(encoding)
-        if a:
-            return json.loads(a)
+        txt = config_source.config_file.read_text(encoding)
+        if txt:
+            return json.loads(txt)
 
     return {}
 
@@ -339,6 +339,10 @@ class PyKDEConnSettings(BaseHostConfig):
             dev = self.devices[remote_id_pack.body.deviceId]
             if must_be_paired and not dev.paired:
                 return None
+
+            if not dev.host_config:
+                dev.host_config = self
+
             return dev
 
         if must_be_paired:
